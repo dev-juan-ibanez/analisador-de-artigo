@@ -16,6 +16,49 @@ export type Saved = { key: string; order: string[]; data: Leitura };
 
 export const emptyLeitura = (): Leitura => ({ pt: [], sc: [], pl: [], dg: [], ia: [] });
 
+/** Conserta o erro mais comum: aspas duplas dentro de textos (“citações” do artigo) e quebras de linha soltas. */
+function repairJson(s: string): string {
+  let out = "";
+  let inStr = false;
+  const stack: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr) {
+      if (c === '"') {
+        // chave ("sc":) aparecendo dentro de uma lista: o agente esqueceu de fechar a lista anterior
+        if (stack[stack.length - 1] === "[" && /^"(?:[^"\\]|\\.)*"\s*:/.test(s.slice(i))) {
+          while (stack[stack.length - 1] === "[") (stack.pop(), (out += "]"));
+          out += ","; // a vírgula sobrando antes de "]" é removida no fim
+        }
+        inStr = true;
+      } else if (c === "{" || c === "[") stack.push(c);
+      else if (c === "}" || c === "]") {
+        const want = c === "}" ? "{" : "[";
+        // colchetes que ficaram sem fechar antes de um "}": fecha-os
+        if (c === "}" && stack.includes("{")) while (stack[stack.length - 1] === "[") (stack.pop(), (out += "]"));
+        const top = stack[stack.length - 1];
+        // fechamento errado, ou que encerra o objeto raiz com texto ainda por vir: descarta
+        if (top !== want || (stack.length === 1 && s.slice(i + 1).trim() !== "")) continue;
+        stack.pop();
+      }
+      out += c;
+      continue;
+    }
+    if (c === "\\") {
+      out += c + (s[i + 1] ?? "");
+      i++;
+    } else if (c === '"') {
+      const next = s.slice(i + 1).match(/^\s*(.)/)?.[1];
+      if (next === undefined || ",]}:".includes(next)) {
+        inStr = false;
+        out += c;
+      } else out += '\\"';
+    } else if (c === "\n" || c === "\r" || c === "\t") out += " ";
+    else out += c;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
 /** Aceita cercas de código e vírgulas sobrando (erros comuns), mas exige JSON de verdade. */
 export function parseLeitura(text: string): Leitura {
   const a = text.indexOf("{");
@@ -26,7 +69,11 @@ export function parseLeitura(text: string): Leitura {
   try {
     j = JSON.parse(body);
   } catch {
-    throw new Error("Resposta do agente com JSON inválido.");
+    try {
+      j = JSON.parse(repairJson(body));
+    } catch {
+      throw new Error("Resposta do agente com JSON inválido.");
+    }
   }
   const list = (x: unknown) => (Array.isArray(x) ? x : []);
   return {

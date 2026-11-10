@@ -314,7 +314,16 @@ export async function runAgent(agent: AgentName, prompt: string, opts: RunOption
     release();
   }
 
-  opts.validate?.(out); // resposta inválida não vai para o cache (o "retomar" a refaz)
+  try {
+    opts.validate?.(out); // resposta inválida não vai para o cache (o "retomar" a refaz)
+  } catch (e) {
+    if (cacheFile) {
+      // guarda a resposta ruim só para diagnóstico (não é lida como cache)
+      await fs.mkdir(path.dirname(cacheFile), { recursive: true });
+      await fs.writeFile(path.join(path.dirname(cacheFile), `invalida-${path.basename(cacheFile)}`), out).catch(() => {});
+    }
+    throw e;
+  }
   if (cacheFile && opts.cacheDir) {
     await fs.mkdir(opts.cacheDir, { recursive: true });
     await fs.writeFile(cacheFile, out);
