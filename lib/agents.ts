@@ -56,7 +56,7 @@ export type AgentName =
 
 /** Rubricas (knowledge/) embutidas na mensagem de cada agente: evita uma volta extra de leitura de arquivo. */
 const RUBRICS: Partial<Record<AgentName, string[]>> = {
-  "revisor-texto": ["compact/portugues.md", "compact/estrutura.md", "compact/ia.md"],
+  "revisor-texto": ["compact/leitura.md"],
   "analista-estrutura": ["compact/estrutura.md"],
   "revisor-resumos": ["compact/resumo.md"],
   "revisor-geral": ["compact/estrutura.md", "compact/ia.md", "compact/citacoes.md"],
@@ -118,10 +118,33 @@ const sleep = (ms: number, signal?: AbortSignal) =>
     );
   });
 
-async function mockAgent(agent: AgentName, opts: RunOptions): Promise<string> {
+/** Simulação realista da leitura integrada: usa o texto recebido (inclui um ¶ errado e um trecho inventado de propósito). */
+function mockLeitura(prompt: string): string {
+  const out: Record<string, unknown[]> = { pt: [], sc: [], pl: [], dg: [], ia: [] };
+  const blocks = [...prompt.matchAll(/### SEÇÃO: "([^"]+)" \(parágrafos ¶\d+–¶\d+\)\n\n([\s\S]*?)(?=\n### SEÇÃO:|$)/g)];
+  const w = (t: string, k: number) => t.split(/\s+/).slice(0, k).join(" ");
+  blocks.forEach(([, title, body], i) => {
+    const ps = [...body.matchAll(/\[¶(\d+)\] ([^\n]+)/g)].map((m) => ({ n: Number(m[1]), t: m[2] }));
+    if (!ps.length) return;
+    const first = ps[0];
+    const last = ps[ps.length - 1];
+    out.pt.push([title, first.n, "B", w(first.t, 5), "correção de exemplo"]);
+    if (ps.length > 1) out.pt.push([title, first.n, "C", w(last.t, 5), "¶ errado de propósito (deve ser corrigido)"]);
+    out.pt.push([title, first.n, "C", "trecho inventado que não existe xyz", "deve ser sinalizado com ⚠️"]);
+    out.sc.push({ s: title, v: "B", p: [[first.n, "C", w(first.t, 4), "problema de exemplo"]] });
+    out.dg.push([title, "síntese de exemplo"]);
+    if (i === 0) {
+      out.pl.push([title, first.n, "A", w(first.t, 5), "motivo de exemplo", w(first.t, 9)]);
+      out.pl.push([title, first.n, "M", w(first.t, 4), "frase de busca inventada", "frase de busca que não existe no texto de jeito nenhum"]);
+    }
+  });
+  return JSON.stringify(out);
+}
+
+async function mockAgent(agent: AgentName, opts: RunOptions, prompt = ""): Promise<string> {
   const text =
     agent === "revisor-texto"
-      ? '{"pt":[["(simulação)",1,"B","exemplo","exemplo"]],"sc":[{"s":"(simulação)","v":"B","p":[[1,"C","exemplo","exemplo"]]}],"pl":[],"dg":[["(simulação)","síntese de exemplo"]],"ia":[]}'
+      ? mockLeitura(prompt)
       : agent === "redator-relatorio"
         ? "# Relatório de correções — (simulação)\n\n## 1. Visão geral do artigo\n**Veredito: Correções necessárias**\n\nTexto simulado."
         : `(simulação do agente ${agent})\n\n| ¶ | Sev. | Trecho | Problema | Sugestão |\n|---|---|---|---|---|\n| 1 | 🟡 | exemplo | exemplo | exemplo |`;
@@ -286,7 +309,7 @@ export async function runAgent(agent: AgentName, prompt: string, opts: RunOption
   await acquire(opts.signal);
   let out: string;
   try {
-    out = mock ? await mockAgent(agent, opts) : await spawnAgent(agent, await withRubrics(agent, prompt, opts.rubrics), opts);
+    out = mock ? await mockAgent(agent, opts, prompt) : await spawnAgent(agent, await withRubrics(agent, prompt, opts.rubrics), opts);
   } finally {
     release();
   }

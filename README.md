@@ -29,7 +29,7 @@ Você envia o arquivo, avança **uma etapa por vez** e, no fim, recebe um relat�
 | — | Conversão para Markdown | Código (**sem IA**): pandoc, pdftotext, LibreOffice | Extrai o texto, promove títulos em negrito a títulos, numera os parágrafos (¶) por seção. |
 | 1 | Citações e referências | Código (**sem IA**) — `lib/citations.ts` | Lista citações e referências, cruza texto × lista (autor-data e numérico; ABNT, APA, Vancouver), aponta *ausentes* e *nunca citadas* e gera links (DOI, Scholar, Crossref, OpenAlex) para a **checagem manual**. |
 | 2 | Resumos (PT · EN · ES) | Agente `revisor-resumos` | Corrige o Resumo, o Abstract e o Resumen no idioma de cada um, avalia a estrutura, as palavras-chave e a consistência entre as três versões. |
-| 3 | Português | Agente `revisor-texto` (**leitura integrada**) | Lê cada trecho **uma única vez** e devolve, de uma vez: erros de português, análise por seção, suspeitas de plágio, síntese e sinais de IA. Esta etapa mostra os achados de português. |
+| 3 | Português | Agente `revisor-texto` (**leitura integrada**) | Lê cada trecho **uma única vez** e devolve, de uma vez: erros de português, análise por seção, suspeitas de plágio, síntese e sinais de IA. O **código confere** cada trecho citado (corrige o ¶ se estiver errado e marca ⚠️ o que não existe no texto). Esta etapa mostra os achados de português. |
 | 4 | Estrutura | Agente `analista-estrutura` | Avalia a divisão em seções (ausentes, ordem, proporção, títulos) só pelo esqueleto e pelo início de cada seção. |
 | 5 | Seção a seção | Resultado da leitura integrada (**custo extra zero**) | Mostra a análise de cada seção: função, lógica, afirmações sem suporte, método, coerência. |
 | 6 | Trechos suspeitos | Resultado da leitura integrada (**custo extra zero**) + links por código | Lista trechos com sinais de cópia/paráfrase para **você pesquisar**, com frase de busca e links (Google, Scholar, Livros). |
@@ -77,11 +77,22 @@ Abra <http://localhost:3000>. Nenhuma chave de API é guardada no projeto: o ace
 5. No **Relatório**, use *Copiar*, *.md* ou *Imprimir / PDF*. Em **Texto numerado**, localize o ¶ citado.
 6. **Histórico** lista os artigos enviados (abrir e excluir).
 
+## Mapa do artigo no Obsidian
+
+Cada artigo ganha um **vault do Obsidian** (`data/jobs/<id>/vault/`), gerado pelo código (sem tokens) a cada etapa concluída:
+um **Mapa** com as seções e os totais de correções, **uma nota por seção** (síntese, correções, sinais de IA, suspeitas de plágio e o texto com âncoras `^p3`),
+e as notas das demais etapas. Em cada correção, o **¶ é um link** que leva direto ao parágrafo; a visão de grafo mostra como tudo se liga.
+Na tela do artigo, o botão **Obsidian** gera o mapa, copia o caminho e tenta abri-lo (se o Obsidian pedir, use *Abrir pasta como cofre* e cole o caminho).
+O Obsidian é opcional: o app funciona sem ele.
+
+> O que economiza tokens não é o Obsidian em si, e sim os dados serem **endereçáveis e guardados por conteúdo**: nada é relido nem recalculado.
+
 ## Economia de tokens
 
 O custo é **mostrado antes de rodar**: cada botão de iniciar traz a estimativa (`≈ N mil tokens`), já descontando o que está guardado, e durante a etapa aparece o uso real (sem leituras de cache).
 
 - **Modo enxuto**: cada chamada de IA roda sem plugins, skills, servidores MCP nem ferramentas do seu Claude Code (~860 tokens de base, em vez de ~10 mil). Se não funcionar no seu ambiente, volta sozinho ao modo padrão (`CLAUDE_LEAN=0` força o padrão).
+- **Versões revisadas custam só o que mudou**: o resultado da leitura é guardado por **hash do conteúdo de cada seção** (`data/store/`). Reenviar a versão corrigida (vrs2 → vrs3) só manda para a IA as seções alteradas; seções idênticas — inclusive de outros arquivos — são reaproveitadas.
 - **Cada trecho do artigo é lido uma única vez** (leitura integrada, guardada em `leitura.json`): Português, Seções e Plágio saem da mesma chamada; Seções e Plágio custam zero. Estrutura recebe só esqueleto + início das seções; Geral trabalha sobre as sínteses; o Relatório monta as tabelas por código e o agente escreve só a narrativa.
 - **Rubricas compactas** (`knowledge/compact/`) embutidas na mensagem, e saídas dos agentes com limite de achados.
 - **Agrupamento**: seções pequenas viram uma só chamada (~14 mil caracteres).
@@ -107,8 +118,17 @@ lib/agents.ts        execução dos agentes pelo Claude Code
 .claude/agents/      definição de cada agente
 knowledge/           rubricas científicas completas (documentação)
 knowledge/compact/   versões compactas usadas nas chamadas de IA
+lib/leitura.ts       dados da leitura integrada, conferência e tabelas (sem IA)
+lib/vault.ts         vault do Obsidian (sem IA)
 data/                resultados locais (não versionado)
 ```
+
+## Como o sistema reduz os riscos da IA
+
+- **Conferência por código**: todo trecho citado pelo agente é procurado no parágrafo indicado; se estiver em outro, o endereço é corrigido; se não existir, aparece com ⚠️ (“conferir”). Frases de busca de plágio não literais perdem o link.
+- **Resposta inválida não entra no cache**: o *Retomar* refaz só aquela parte.
+- **Cache invalidado por edição**: mudar um agente ou rubrica invalida as leituras guardadas.
+- Ainda assim, **a revisão do professor é indispensável** (veja o aviso no topo).
 
 ## Limitações conhecidas
 

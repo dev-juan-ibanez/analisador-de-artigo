@@ -91,6 +91,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [drawer, setDrawer] = useState(false);
+  const [info, setInfo] = useState<string | null>(null);
   const [est, setEst] = useState<Record<string, number | null>>({});
 
   const anyRunning = jobs.some(anyLive) || (!!job && anyLive(job));
@@ -240,6 +241,19 @@ export default function Home() {
     if (j.ok) apply(await j.json());
   }
 
+  /** Abre o mapa do artigo (vault do Obsidian) e copia o caminho, para o caso de o Obsidian pedir a pasta. */
+  async function openObsidian() {
+    if (!job) return;
+    const r = await fetch(`/api/jobs/${job.id}/vault`).catch(() => null);
+    if (!r?.ok) return setError("Não consegui preparar o mapa do Obsidian.");
+    const d: { path: string; uri: string } = await r.json();
+    try {
+      await navigator.clipboard.writeText(d.path);
+    } catch {}
+    setInfo(`Mapa gerado em: ${d.path} (caminho copiado). Se o Obsidian não abrir sozinho: “Abrir pasta como cofre” e cole o caminho.`);
+    window.location.href = d.uri;
+  }
+
   async function cancel() {
     if (!job) return;
     if (!window.confirm("Cancelar a análise em andamento?\n\nO que já foi analisado fica guardado e você poderá retomar de onde parou.")) return;
@@ -380,12 +394,28 @@ export default function Home() {
               >
                 <Icon name="file" /> Texto numerado
               </button>
+              <button
+                onClick={openObsidian}
+                title="Abre o mapa deste artigo no Obsidian: uma nota por seção, com link para cada parágrafo"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1 text-sm hover:border-accent hover:text-accent"
+              >
+                <Icon name="sparkle" /> Obsidian
+              </button>
             </div>
           </div>
         )}
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
+        {info && (
+          <div role="status" className="no-print mb-4 flex items-start gap-2 rounded-xl border border-accent/30 bg-accent/5 p-3 text-sm">
+            <Icon name="file" className="mt-0.5 size-4 shrink-0 text-accent" />
+            <span className="flex-1 break-all">{info}</span>
+            <button onClick={() => setInfo(null)} aria-label="Fechar aviso" className="text-muted hover:text-fg">
+              <Icon name="x" />
+            </button>
+          </div>
+        )}
         {error && (
           <div role="alert" className="no-print mb-4 flex items-start gap-2 rounded-xl border border-bad/40 bg-bad/10 p-3 text-sm">
             <Icon name="alert" className="mt-0.5 size-4 shrink-0 text-bad" />

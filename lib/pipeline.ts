@@ -5,10 +5,15 @@ import { CancelledError, definitionHash, isMock, peekCache, promptOverheadChars,
 import { splitSections } from "./convert";
 import { isAbstractTitle, numberSections, type NumberedSection } from "./numbering";
 import { splitBodyAndReferences, type CitationReport } from "./citations";
+import {
+  RISK, SEV, VERDICT, bySection, canon, cell, countLine, emptyLeitura, merge, parseLeitura, plagioItems, renderPlagio,
+  renderPortugues, renderSecoes, rowsOf, table, verifyLeitura, type Leitura, type Row, type Saved,
+} from "./leitura";
+import { syncVault } from "./vault";
 import { endRun, jobFile, readOptional, registerRun, updateStep, ROOT, type StepId } from "./jobs";
 
 // Por chamada de IA: agrupa seções pequenas e divide as muito grandes (menos chamadas = menos tokens).
-const CHUNK_LIMIT = 14000; // caracteres
+const CHUNK_LIMIT = 22000; // caracteres por chamada (as peças são guardadas uma a uma, então chamadas grandes não prejudicam o reaproveitamento)
 
 
 /** Contexto de uma execução de etapa. */
@@ -127,15 +132,19 @@ const put = (ctx: Ctx, name: string, content: string) => (ctx.dry ? Promise.reso
 
 // ---------- Agrupamento de seções em chamadas ----------
 
-type Piece = { title: string; start: number; end: number; text: string };
+/** Peça = seção (ou parte dela) com chave pelo CONTEÚDO: se o texto não mudou, o resultado é reaproveitado. */
+type Piece = { title: string; start: number; end: number; text: string; key: string };
 
-function piecesOf(s: NumberedSection): Piece[] {
+function piecesOf(s: NumberedSection, salt: string): Piece[] {
   const out: Piece[] = [];
   let cur: string[] = [];
   let len = 0;
   let start = 1;
   const flush = (end: number) => {
-    if (cur.length) out.push({ title: s.title, start, end, text: cur.join("\n\n") });
+    if (!cur.length) return;
+    const text = cur.join("\n\n");
+    const key = createHash("sha1").update(`${salt}\0${s.title}\0${start}-${end}\0${text}`).digest("hex");
+    out.push({ title: s.title, start, end, text, key });
   };
   s.paras.forEach((p, i) => {
     const marked = `[¶${i + 1}] ${p}`;
@@ -152,25 +161,24 @@ function piecesOf(s: NumberedSection): Piece[] {
   return out;
 }
 
-type Chunk = { label: string; text: string };
+type Chunk = { label: string; text: string; pieces: Piece[] };
 
-/** Junta seções consecutivas até CHUNK_LIMIT. Cada seção vem sob "### SEÇÃO: ..." com parágrafos [¶n]. */
-function packChunks(sections: NumberedSection[]): Chunk[] {
+/** Junta peças consecutivas até CHUNK_LIMIT. Cada peça vem sob "### SEÇÃO: ..." com parágrafos [¶n]. */
+function packChunks(pieces: Piece[]): Chunk[] {
   const chunks: Chunk[] = [];
-  let text = "";
-  let labels: string[] = [];
-  const push = () => {
-    if (text) chunks.push({ label: labels.join(" + "), text });
-    text = "";
-    labels = [];
-  };
-  for (const p of sections.flatMap(piecesOf)) {
+  let cur: Chunk | null = null;
+  for (const p of pieces) {
     const block = `### SEÇÃO: "${p.title}" (parágrafos ¶${p.start}–¶${p.end})\n\n${p.text}\n\n`;
-    if (text.length + block.length > CHUNK_LIMIT && text) push();
-    text += block;
-    labels.push(p.title);
+    if (cur && cur.text.length + block.length > CHUNK_LIMIT) {
+      chunks.push(cur);
+      cur = null;
+    }
+    cur ??= { label: "", text: "", pieces: [] };
+    cur.text += block;
+    cur.pieces.push(p);
   }
-  push();
+  if (cur) chunks.push(cur);
+  for (const c of chunks) c.label = [...new Set(c.pieces.map((p) => p.title))].join(" + ");
   return chunks;
 }
 
@@ -233,39 +241,22 @@ async function stepResumos(ctx: Ctx) {
 
 // ---------- Leitura integrada: UMA leitura de cada trecho, reaproveitada por várias etapas ----------
 // Português, Seções, Plágio (e as sínteses usadas por Geral/Relatório) saem da MESMA chamada por trecho.
-// O resultado fica em leitura.json; as etapas seguintes só o exibem (custo zero).
+// Cada peça (seção) é guardada pelo hash do seu conteúdo em data/store/leitura/: reenviar uma versão revisada
+// do artigo só paga pelas seções que mudaram. O agregado do artigo fica em leitura.json.
 
-type Row3 = [string, number, string, string, string];
-type Leitura = {
-  pt: Row3[]; // [seção, ¶, sev, trecho, correção]
-  sc: { s: string; v: string; p: [number, string, string, string][] }[]; // por seção
-  pl: [string, number, string, string, string, string][]; // [seção, ¶, risco, trecho, motivo, consulta]
-  dg: [string, string][]; // [seção, síntese]
-  ia: [string, number, string, string][]; // [seção, ¶, sinal, trecho]
-};
-const emptyLeitura = (): Leitura => ({ pt: [], sc: [], pl: [], dg: [], ia: [] });
+const STORE_DIR = path.join(ROOT, "data", "store", "leitura");
 
-function parseLeitura(text: string): Leitura {
-  const a = text.indexOf("{");
-  const b = text.lastIndexOf("}");
-  if (a < 0 || b <= a) throw new Error("Resposta do agente sem JSON.");
-  let j: Record<string, unknown>;
+async function readStore(key: string): Promise<Leitura | null> {
   try {
-    j = JSON.parse(text.slice(a, b + 1));
+    return JSON.parse(await fs.readFile(path.join(STORE_DIR, `${key}.json`), "utf8"));
   } catch {
-    throw new Error("Resposta do agente com JSON inválido.");
+    return null;
   }
-  const list = (x: unknown) => (Array.isArray(x) ? x : []);
-  return {
-    pt: list(j.pt).filter(Array.isArray) as Leitura["pt"],
-    sc: list(j.sc).filter((x) => x && typeof x === "object") as Leitura["sc"],
-    pl: list(j.pl).filter(Array.isArray) as Leitura["pl"],
-    dg: list(j.dg).filter(Array.isArray) as Leitura["dg"],
-    ia: list(j.ia).filter(Array.isArray) as Leitura["ia"],
-  };
 }
-
-type Saved = { key: string; order: string[]; data: Leitura };
+async function writeStore(key: string, data: Leitura) {
+  await fs.mkdir(STORE_DIR, { recursive: true });
+  await fs.writeFile(path.join(STORE_DIR, `${key}.json`), JSON.stringify(data));
+}
 
 async function loadLeitura(id: string): Promise<Saved | null> {
   try {
@@ -275,16 +266,32 @@ async function loadLeitura(id: string): Promise<Saved | null> {
   }
 }
 
-/** Devolve a leitura já feita; só chama a IA se ainda não existir (ou se o texto/agente mudou). */
+/** Distribui o resultado de uma chamada (várias seções) entre as peças do trecho. */
+function splitByPiece(L: Leitura, chunk: Chunk): Map<string, Leitura> {
+  const titles = [...new Set(chunk.pieces.map((p) => p.title))];
+  const out = new Map(chunk.pieces.map((p) => [p.key, emptyLeitura()]));
+  const pick = (sec: unknown, par?: number) => {
+    const t = canon(titles, sec);
+    const cands = chunk.pieces.filter((p) => p.title === t);
+    if (!cands.length) return chunk.pieces[0];
+    return cands.length === 1 ? cands[0] : (cands.find((p) => par !== undefined && par >= p.start && par <= p.end) ?? cands[0]);
+  };
+  for (const r of L.pt) out.get(pick(r[0], Number(r[1])).key)!.pt.push(r);
+  for (const sc of L.sc) out.get(pick(sc.s, Number(sc.p?.[0]?.[0])).key)!.sc.push(sc);
+  for (const r of L.pl) out.get(pick(r[0], Number(r[1])).key)!.pl.push(r);
+  for (const d of L.dg) out.get(pick(d[0]).key)!.dg.push(d);
+  for (const r of L.ia) out.get(pick(r[0], Number(r[1])).key)!.ia.push(r);
+  return out;
+}
+
+/** Devolve a leitura já feita; só chama a IA para as seções que ainda não foram lidas (ou que mudaram). */
 async function getLeitura(ctx: Ctx): Promise<Saved> {
   const sections = await getSections(ctx.id);
   const order = sections.map((s) => s.title);
-  const chunks = packChunks(sections);
-  const key = createHash("sha1")
-    .update(chunks.map((c) => c.text).join("\0"))
-    .update(await definitionHash("revisor-texto"))
-    .update(isMock() ? "MOCK" : "REAL") // leitura simulada nunca vale para uma execução real
-    .digest("hex");
+  const salt = `${await definitionHash("revisor-texto")}|${isMock() ? "MOCK" : "REAL"}`;
+  const pieces = sections.flatMap((s) => piecesOf(s, salt));
+  const key = createHash("sha1").update(pieces.map((p) => p.key).join("\0")).digest("hex");
+
   const saved = await loadLeitura(ctx.id);
   if (saved && saved.key === key) {
     ctx.total = 1;
@@ -292,130 +299,44 @@ async function getLeitura(ctx: Ctx): Promise<Saved> {
     await publish(ctx, true);
     return saved; // já lido: nenhuma chamada de IA
   }
+
+  const known = new Map<string, Leitura>();
+  for (const p of pieces) {
+    const hit = await readStore(p.key);
+    if (hit) known.set(p.key, hit);
+  }
+  const todo = pieces.filter((p) => !known.has(p.key));
+  const chunks = packChunks(todo);
   const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
   const title = /^#\s+(.+)$/m.exec(md)?.[1]?.replace(/[*_]/g, "").trim() ?? "(sem título)";
-  const parts = await pool(
-    ctx,
-    chunks.map((c) => async () => {
-      const out = await ai(ctx, "revisor-texto", `TÍTULO DO ARTIGO: ${title}\n${MARKS}\n\n${c.text}`, {
-        cache: "leitura",
-        validate: (o) => void parseLeitura(o),
-      });
-      return ctx.dry ? emptyLeitura() : parseLeitura(out);
-    }),
-  );
-  const data = emptyLeitura();
-  for (const x of parts) {
-    data.pt.push(...x.pt);
-    data.sc.push(...x.sc);
-    data.pl.push(...x.pl);
-    data.dg.push(...x.dg);
-    data.ia.push(...x.ia);
+
+  if (chunks.length) {
+    await pool(
+      ctx,
+      chunks.map((c) => async () => {
+        const out = await ai(ctx, "revisor-texto", `TÍTULO DO ARTIGO: ${title}\n${MARKS}\n\n${c.text}`, {
+          cache: "leitura",
+          validate: (o) => void parseLeitura(o),
+        });
+        if (ctx.dry) return;
+        for (const [k, data] of splitByPiece(parseLeitura(out), c)) {
+          known.set(k, data);
+          await writeStore(k, data); // guardado por conteúdo: vale para este e para outros arquivos
+        }
+      }),
+    );
+  } else {
+    ctx.total = 1;
+    ctx.completed = 1;
+    await publish(ctx, true);
   }
+
+  // Agrega em ordem de documento e confere endereços/trechos (sem tokens).
+  const raw = merge(pieces.map((p) => known.get(p.key) ?? emptyLeitura()));
+  const { data } = verifyLeitura(raw, sections);
   const result: Saved = { key, order, data };
   if (!ctx.dry) await fs.writeFile(jobFile(ctx.id, "leitura.json"), JSON.stringify(result));
   return result;
-}
-
-// ---- apresentação (feita pelo código: sem tokens) ----
-const SEV = { A: "🔴", B: "🟠", C: "🟡" } as const;
-type SevKey = keyof typeof SEV;
-const sevOf = (x: unknown): SevKey => (["A", "B", "C"].includes(String(x).toUpperCase()) ? (String(x).toUpperCase() as SevKey) : "C");
-const VERDICT: Record<string, string> = { A: "Adequada", B: "Ajustes menores", C: "Revisão substancial", D: "Inadequada" };
-const cell = (x: unknown) => String(x ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
-const norm = (t: string) => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-
-/** Casa o nome de seção devolvido pelo agente com o título real do documento. */
-function canon(order: string[], name: unknown): string {
-  const n = norm(String(name ?? ""));
-  return order.find((t) => norm(t) === n) ?? order.find((t) => n && (norm(t).includes(n) || n.includes(norm(t)))) ?? String(name ?? "(sem seção)");
-}
-
-type Row = { sec: string; par: number; sev: SevKey; tipo: "Português" | "Conteúdo"; trecho: string; txt: string };
-
-function rowsOf(L: Leitura, order: string[]): { rows: Row[]; verdict: Map<string, string> } {
-  const rows: Row[] = [];
-  const verdict = new Map<string, string>();
-  for (const r of L.pt) rows.push({ sec: canon(order, r[0]), par: Number(r[1]) || 0, sev: sevOf(r[2]), tipo: "Português", trecho: String(r[3] ?? ""), txt: String(r[4] ?? "") });
-  for (const sc of L.sc) {
-    const sec = canon(order, sc.s);
-    const v = String(sc.v ?? "").toUpperCase();
-    if (v && (!verdict.has(sec) || v > (verdict.get(sec) ?? ""))) verdict.set(sec, v); // pior veredito entre trechos
-    for (const p of Array.isArray(sc.p) ? sc.p : [])
-      rows.push({ sec, par: Number(p[0]) || 0, sev: sevOf(p[1]), tipo: "Conteúdo", trecho: String(p[2] ?? ""), txt: String(p[3] ?? "") });
-  }
-  return { rows, verdict };
-}
-
-const bySection = (order: string[], rows: Row[]) => {
-  const secs = [...order, ...rows.map((r) => r.sec).filter((s) => !order.includes(s))];
-  return [...new Set(secs)].map((sec) => ({ sec, rows: rows.filter((r) => r.sec === sec).sort((a, b) => a.par - b.par || a.sev.localeCompare(b.sev)) }));
-};
-
-function table(rows: Row[], withTipo: boolean) {
-  const head = withTipo ? "| ¶ | Sev. | Tipo | Trecho (marcar em vermelho) | O que corrigir |\n|---|---|---|---|---|" : "| ¶ | Sev. | Trecho | O que corrigir |\n|---|---|---|---|";
-  const body = rows.map((r) => (withTipo ? `| ${r.par || "geral"} | ${SEV[r.sev]} | ${r.tipo} | ${cell(r.trecho)} | ${cell(r.txt)} |` : `| ${r.par || "geral"} | ${SEV[r.sev]} | ${cell(r.trecho)} | ${cell(r.txt)} |`));
-  return `${head}\n${body.join("\n")}`;
-}
-
-const countLine = (rows: Row[]) =>
-  (["A", "B", "C"] as SevKey[]).map((k) => `${SEV[k]} ${rows.filter((r) => r.sev === k).length}`).join("  ");
-
-function renderPortugues(saved: Saved) {
-  const { rows } = rowsOf(saved.data, saved.order);
-  const pt = rows.filter((r) => r.tipo === "Português");
-  const L = ["# Revisão de português", "", `Achados: **${pt.length}** (${countLine(pt)})`, ""];
-  for (const g of bySection(saved.order, pt)) {
-    L.push(`## ${g.sec}`, "", g.rows.length ? table(g.rows, false) : "Sem correções relevantes.", "");
-  }
-  return L.join("\n");
-}
-
-function renderSecoes(saved: Saved) {
-  const { rows, verdict } = rowsOf(saved.data, saved.order);
-  const ct = rows.filter((r) => r.tipo === "Conteúdo");
-  const L = ["# Análise seção a seção", ""];
-  for (const g of bySection(saved.order, ct)) {
-    const v = VERDICT[verdict.get(g.sec) ?? ""] ?? "—";
-    L.push(`### ${g.sec} — ${v}`, "", g.rows.length ? table(g.rows, false) : "Sem problemas relevantes.", "");
-  }
-  return L.join("\n");
-}
-
-const RISK: Record<string, string> = { A: "alto", M: "médio", B: "baixo" };
-const gq = (s: string) => encodeURIComponent(`"${s.replace(/["“”]/g, "").trim()}"`);
-
-function plagioItems(saved: Saved) {
-  const rank: Record<string, number> = { A: 0, M: 1, B: 2 };
-  return saved.data.pl
-    .map((r) => ({ sec: canon(saved.order, r[0]), par: Number(r[1]) || 0, risk: String(r[2] ?? "B").toUpperCase(), trecho: String(r[3] ?? ""), motivo: String(r[4] ?? ""), q: String(r[5] ?? "") }))
-    .sort((a, b) => (rank[a.risk] ?? 3) - (rank[b.risk] ?? 3));
-}
-
-function renderPlagio(saved: Saved) {
-  const items = plagioItems(saved);
-  const L = [
-    "# Trechos para checar possível plágio",
-    "",
-    "> ⚠️ Esta lista **não** prova plágio: a IA não consulta bases de comparação. São trechos com sinais (mudança de estilo, texto de manual, afirmações sem fonte etc.) para você **pesquisar**. Para verificação formal use Turnitin, iThenticate ou Copyleaks (ou a ferramenta da sua instituição).",
-    "",
-    `Trechos sinalizados: **${items.length}**`,
-    "",
-  ];
-  items.forEach((p, i) => {
-    L.push(
-      `### ${i + 1}. [${RISK[p.risk] ?? p.risk}] ${p.sec}${p.par ? `, ¶${p.par}` : ""}`,
-      `> ${p.trecho}`,
-      "",
-      `**Por que suspeito:** ${p.motivo}`,
-      "",
-      p.q
-        ? `**Pesquisar:** [Google (frase exata)](https://www.google.com/search?q=${gq(p.q)}) · [Scholar](https://scholar.google.com/scholar?q=${gq(p.q)}) · [Google Livros](https://www.google.com/search?tbm=bks&q=${gq(p.q)})  \nFrase: \`${p.q}\``
-        : "",
-      "",
-    );
-  });
-  return L.join("\n");
 }
 
 async function stepPortugues(ctx: Ctx) {
@@ -687,6 +608,7 @@ export async function runStep(id: string, step: StepId, opts: { force?: boolean 
       tokens: ctx.tokens,
       durationMs,
     });
+    await syncVault(id).catch(() => {}); // mapa do Obsidian (sem tokens); nunca derruba a etapa
   } catch (e) {
     const finishedAt = new Date().toISOString();
     if (ctl.signal.reason === "limit" || e instanceof UsageLimitError) {
