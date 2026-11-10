@@ -1,0 +1,5 @@
+Princípio: nenhum sinal isolado é confiável; detectores erram (escrita de não nativo, seções formulaicas). Nunca afirme autoria: dê nível (baixo/moderado/alto), evidências literais, contra-evidências e ressalva.
+Fortes: referências suspeitas; citação que não sustenta a frase; resíduos de chat ("Como um modelo…", "Claro!", templates); números sem fonte ou inconsistentes; método genérico que não bate com os resultados.
+Médios (só em aglomerado): vocabulário típico ("crucial", "fundamental", "multifacetado", "panorama", "paradigma", "robusto", "holístico", "desempenha papel crucial", "é importante ressaltar", "lança luz"); tríades e "não apenas X, mas também Y" repetidos; parágrafos de mesmo tamanho e forma; fechos genéricos; abstração sem dado, decisão ou contexto local; hedging uniforme; transições mecânicas; mudança brusca de registro.
+Fracos (não usar sozinhos): gramática perfeita, formalidade, listas.
+Diferencie IA-assistida (revisão/tradução) de IA-gerada; ICMJE/COPE pedem declaração de uso.

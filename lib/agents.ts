@@ -54,17 +54,15 @@ export type AgentName =
   | "revisor-resumos"
   | "cacador-plagio"
   | "revisor-geral"
-  | "detector-ia"
   | "redator-relatorio";
 
 /** Rubricas (knowledge/) embutidas na mensagem de cada agente: evita uma volta extra de leitura de arquivo. */
 const RUBRICS: Partial<Record<AgentName, string[]>> = {
-  "revisor-portugues": ["02-portugues-academico.md"],
-  "analista-secao": ["01-estrutura-cientifica.md"],
-  "analista-estrutura": ["01-estrutura-cientifica.md"],
-  "revisor-resumos": ["05-resumo-pt-en-es.md", "02-portugues-academico.md"],
-  "revisor-geral": ["01-estrutura-cientifica.md", "04-citacoes-e-referencias.md"],
-  "detector-ia": ["03-padroes-ia.md", "04-citacoes-e-referencias.md"],
+  "revisor-portugues": ["compact/portugues.md"],
+  "analista-secao": ["compact/estrutura.md"],
+  "analista-estrutura": ["compact/estrutura.md"],
+  "revisor-resumos": ["compact/resumo.md"],
+  "revisor-geral": ["compact/estrutura.md", "compact/ia.md", "compact/citacoes.md"],
 };
 
 async function withRubrics(agent: AgentName, prompt: string, override?: string[]): Promise<string> {
@@ -85,7 +83,7 @@ export type RunOptions = {
   rubrics?: string[];
   /** Caracteres de texto gerados até agora (andamento em tempo real). */
   onProgress?: (chars: number) => void;
-  /** Tokens usados por esta chamada (entrada + saída). */
+  /** Tokens novos desta chamada (entrada + saída, sem leituras de cache). */
   onUsage?: (tokens: number) => void;
   timeoutMs?: number;
   model?: string;
@@ -144,7 +142,8 @@ async function definitionHash(agent: AgentName): Promise<string> {
   try {
     h.update(await fs.readFile(path.join(ROOT, ".claude", "agents", `${agent}.md`), "utf8"));
     const dir = path.join(ROOT, "knowledge");
-    for (const f of (await fs.readdir(dir)).sort()) h.update(await fs.readFile(path.join(dir, f), "utf8"));
+    for (const f of (await fs.readdir(path.join(dir, "compact"))).sort())
+      h.update(await fs.readFile(path.join(dir, "compact", f), "utf8"));
   } catch {}
   return h.digest("hex");
 }
@@ -200,7 +199,8 @@ function spawnOnce(agent: AgentName, prompt: string, opts: RunOptions, emptyMcp:
     } else {
       args.push("--tools", "Read", "--allowedTools", "Read");
     }
-    const model = opts.model ?? process.env.CLAUDE_MODEL;
+    // Modelo: CLAUDE_MODEL_<AGENTE> (ex.: CLAUDE_MODEL_REVISOR_PORTUGUES=haiku) > CLAUDE_MODEL > padrão do Claude Code
+    const model = opts.model ?? process.env[`CLAUDE_MODEL_${agent.toUpperCase().replace(/-/g, "_")}`] ?? process.env.CLAUDE_MODEL;
     if (model) args.push("--model", model);
     const child = spawn("claude", args, { cwd: ROOT, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     let raw = ""; // toda a saída (para detectar mensagens de erro/limite)
@@ -244,7 +244,7 @@ function spawnOnce(agent: AgentName, prompt: string, opts: RunOptions, emptyMcp:
             isError = !!e.is_error;
             const u = e.usage ?? {};
             opts.onUsage?.(
-              (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0),
+              (u.input_tokens ?? 0) + (u.output_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0), // leituras de cache não contam
             );
           }
         } catch {}
@@ -297,4 +297,38 @@ export async function runAgent(agent: AgentName, prompt: string, opts: RunOption
     await fs.writeFile(cacheFile, out);
   }
   return out;
+}
+
+async function cacheFileFor(agent: AgentName, prompt: string, opts: RunOptions) {
+  if (!opts.cacheDir) return null;
+  const key = createHash("sha1")
+    .update(`${isMock() ? "MOCK" : "REAL"}\0${agent}\0${await definitionHash(agent)}\0${(opts.rubrics ?? []).join(",")}\0${prompt}`)
+    .digest("hex");
+  return path.join(opts.cacheDir, `${key}.txt`);
+}
+
+/** Já existe resultado guardado para esta chamada? (usado na estimativa de tokens) */
+export async function peekCache(agent: AgentName, prompt: string, opts: RunOptions): Promise<boolean> {
+  const f = await cacheFileFor(agent, prompt, opts);
+  if (!f) return false;
+  try {
+    await fs.access(f);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Caracteres fixos de cada chamada além da mensagem: rubricas + definição do agente + sistema. */
+export async function promptOverheadChars(agent: AgentName, override?: string[]): Promise<number> {
+  let n = 1800; // sistema mínimo do Claude Code no modo enxuto
+  try {
+    n += (await fs.readFile(path.join(ROOT, ".claude", "agents", `${agent}.md`), "utf8")).length;
+  } catch {}
+  for (const f of override ?? RUBRICS[agent] ?? []) {
+    try {
+      n += (await fs.readFile(path.join(ROOT, "knowledge", f), "utf8")).length;
+    } catch {}
+  }
+  return n;
 }

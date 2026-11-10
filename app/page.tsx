@@ -69,6 +69,9 @@ function verdictOf(md: string): { text: string; tone: string } | null {
   return { text, tone };
 }
 
+const fmtTokens = (t?: number | null) =>
+  t == null ? "" : t < 1000 ? `≈ ${Math.max(100, Math.round(t / 100) * 100)} tokens` : `≈ ${Math.round(t / 1000)} mil tokens`;
+
 function Bar({ pct, tone = "bg-accent" }: { pct: number; tone?: string }) {
   return (
     <div className="h-2 overflow-hidden rounded-full bg-line" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
@@ -88,6 +91,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [drawer, setDrawer] = useState(false);
+  const [est, setEst] = useState<Record<string, number | null>>({});
 
   const anyRunning = jobs.some(anyLive) || (!!job && anyLive(job));
 
@@ -161,6 +165,27 @@ export default function Home() {
       cancelled = true;
     };
   }, [tabKey, state?.status, geralStatus, view]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Estimativa de tokens (sem gastar nada) da etapa atual e da próxima, para mostrar nos botões de iniciar
+  const nextStep = WIZARD[idx + 1]?.step;
+  const curStep = current.step;
+  const curStatus = state?.status;
+  const nextStatusKey = nextStep ? job?.steps[nextStep]?.status : undefined;
+  useEffect(() => {
+    if (!job || view !== "analise") return;
+    const id = job.id;
+    let cancelled = false;
+    for (const st of [curStep, nextStep]) {
+      if (!st || st === "citacoes") continue;
+      fetch(`/api/jobs/${id}/estimate/${st}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => !cancelled && setEst((e) => ({ ...e, [`${id}:${st}`]: d?.tokens ?? null })))
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [job?.id, view, curStep, nextStep, curStatus, nextStatusKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loaded = doc?.key === tabKey;
   const texts = loaded ? doc.texts : [];
@@ -281,8 +306,14 @@ export default function Home() {
   const currentOk = !current.ai || state?.status === "done";
   const nextBusy = nextStatus !== "done" && nextStatus !== "running" && anyRunning;
   const canNext = currentOk && !nextBusy;
+  const nextEst = job && nextTab ? est[`${job.id}:${nextTab.step}`] : null;
+  const curEst = job ? est[`${job.id}:${current.step}`] : null;
   const nextLabel =
-    nextStatus === "done" ? "Próximo" : nextStatus === "running" ? "Ver andamento" : `Iniciar: ${nextTab?.label}`;
+    nextStatus === "done"
+      ? "Próximo"
+      : nextStatus === "running"
+        ? "Ver andamento"
+        : `Iniciar: ${nextTab?.label}${nextEst ? ` (${fmtTokens(nextEst)})` : ""}`;
   const frontier = job ? frontierOf(job) : 0;
   const verdict = tab === "relatorio" && raw ? verdictOf(raw) : null;
   const resumable = state?.status === "cancelled" || state?.status === "error";
@@ -601,7 +632,7 @@ export default function Home() {
                       disabled={anyRunning}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 font-medium text-accent-fg disabled:opacity-40"
                     >
-                      <Icon name="play" /> Retomar de onde parou
+                      <Icon name="play" /> Retomar de onde parou{curEst ? ` (${fmtTokens(curEst)} restantes)` : ""}
                     </button>
                     <button
                       onClick={() => run(current.step, true)}
@@ -640,7 +671,7 @@ export default function Home() {
                         disabled={anyRunning}
                         className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-fg disabled:opacity-40"
                       >
-                        <Icon name="play" /> Iniciar {current.label.toLowerCase()}
+                        <Icon name="play" /> Iniciar {current.label.toLowerCase()}{curEst ? ` (${fmtTokens(curEst)})` : ""}
                       </button>
                     )}
                   </div>

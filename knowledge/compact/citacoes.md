@@ -1,0 +1,1 @@
+Citações: o cruzamento texto×lista é automático; a existência de cada obra é checada à mão pelo professor. Avalie: atualidade e diversidade das fontes, uso crítico (não só lista), autocitação desproporcional, apud excessivo, citação direta sem página, fonte secundária no lugar da primária, mistura de normas (ABNT/APA/Vancouver).

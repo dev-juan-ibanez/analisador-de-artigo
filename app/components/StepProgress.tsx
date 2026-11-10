@@ -59,7 +59,7 @@ export function StepProgress({
           <p className="text-xs text-muted">
             {parts}
             {words > 0 ? `${words.toLocaleString("pt-BR")} palavras geradas · ` : "iniciando a IA… · "}
-            {state.tokens ? `${Math.round(state.tokens / 1000)} mil tokens · ` : ""}
+            {state.tokens ? `${state.tokens < 1000 ? state.tokens : `${(state.tokens / 1000).toFixed(1).replace(".", ",")} mil`} tokens · ` : ""}
             {elapsed} decorridos
           </p>
         </div>

@@ -28,12 +28,12 @@ Você envia o arquivo, avança **uma etapa por vez** e, no fim, recebe um relat�
 |---|-------|----------|-----------|
 | — | Conversão para Markdown | Código (**sem IA**): pandoc, pdftotext, LibreOffice | Extrai o texto, promove títulos em negrito a títulos, numera os parágrafos (¶) por seção. |
 | 1 | Citações e referências | Código (**sem IA**) — `lib/citations.ts` | Lista citações e referências, cruza texto × lista (autor-data e numérico; ABNT, APA, Vancouver), aponta *ausentes* e *nunca citadas* e gera links (DOI, Scholar, Crossref, OpenAlex) para a **checagem manual**. |
-| 2 | Resumos (PT · EN · ES) | Agente `revisor-resumos` (3 chamadas em paralelo, uma por idioma) | Corrige o Resumo, o Abstract e o Resumen no idioma de cada um, avalia a estrutura do resumo, as palavras-chave e a consistência entre as três versões. |
+| 2 | Resumos (PT · EN · ES) | Agente `revisor-resumos` (1 chamada curta) | Corrige o Resumo, o Abstract e o Resumen no idioma de cada um, avalia a estrutura do resumo, as palavras-chave e a consistência entre as três versões. |
 | 3 | Português | Agente `revisor-portugues` | Ortografia, gramática, concordância, regência, pontuação, clareza e registro acadêmico, com seção + ¶ e sugestão. |
 | 4 | Estrutura | Agente `analista-estrutura` | Avalia a divisão em seções (ausentes, ordem, proporção, títulos, hierarquia) e sugere reorganização. |
 | 5 | Seção a seção | Agente `analista-secao` | Analisa cada seção: função, lógica, afirmações sem suporte, método, coerência com o objetivo. |
 | 6 | Trechos suspeitos | Agente `cacador-plagio` + links por código | Marca trechos com sinais de cópia/paráfrase para **você pesquisar**, com frase de busca e links (Google, Scholar, Livros). |
-| 7 | Geral e indícios de IA | Agentes `revisor-geral` e `detector-ia` | Avalia o artigo inteiro (contribuição, cadeia objetivo→conclusão, rigor) e procura indícios de texto gerado por IA, com evidências, contra-evidências e ressalvas. |
+| 7 | Geral e indícios de IA | Agente `revisor-geral` (uma única leitura do artigo) | Avalia o artigo inteiro (contribuição, cadeia objetivo→conclusão, rigor) e procura indícios de texto gerado por IA, com evidências, contra-evidências e ressalvas. |
 | 8 | Relatório final | Agente `redator-relatorio` | Consolida tudo: veredito (*Aprovado — sem correções* / *ajustes menores* / *correções necessárias* / *reescrita*) e correções por seção e parágrafo. |
 
 Os agentes ficam em [`.claude/agents/`](.claude/agents) e rodam pelo **Claude Code** instalado na sua máquina.
@@ -79,13 +79,15 @@ Abra <http://localhost:3000>. Nenhuma chave de API é guardada no projeto: o ace
 
 ## Economia de tokens
 
-- **Modo enxuto**: cada chamada de IA roda sem plugins, skills, servidores MCP nem ferramentas do seu Claude Code (~860 tokens de base, em vez de ~10 mil).
-  Se isso não funcionar no seu ambiente, o sistema volta sozinho ao modo padrão. Para forçar o modo padrão: `CLAUDE_LEAN=0`.
-- **Rubricas embutidas** na mensagem (uma única volta, sem leitura de arquivo).
-- **Agrupamento**: seções pequenas viram uma só chamada (cerca de 14 mil caracteres por chamada).
-- **Cache por trecho**: retomar não paga de novo o que já foi analisado (o cache é invalidado se você editar um agente ou uma rubrica).
+O custo é **mostrado antes de rodar**: cada botão de iniciar traz a estimativa (`≈ N mil tokens`), já descontando o que está guardado, e durante a etapa aparece o uso real (sem leituras de cache).
+
+- **Modo enxuto**: cada chamada de IA roda sem plugins, skills, servidores MCP nem ferramentas do seu Claude Code (~860 tokens de base, em vez de ~10 mil). Se não funcionar no seu ambiente, volta sozinho ao modo padrão (`CLAUDE_LEAN=0` força o padrão).
+- **O artigo é lido o mínimo possível**: Estrutura recebe só o esqueleto e o início de cada seção; Geral e Indícios de IA compartilham **uma** leitura; o Relatório consolida só as análises (não reenvia o artigo); a busca de plágio ignora Métodos/Resultados (dados do autor).
+- **Rubricas compactas** (`knowledge/compact/`) embutidas na mensagem, e saídas dos agentes com limite de achados.
+- **Agrupamento**: seções pequenas viram uma só chamada (~14 mil caracteres).
+- **Cache por trecho**: retomar não paga de novo o que já foi analisado (invalidado se você editar um agente ou rubrica).
 - **Modo simulação** (sem gastar nada, para testar a interface): crie o arquivo `data/MOCK` (opcional: nele, o atraso em ms por chamada).
-- Variáveis: `CLAUDE_MODEL` (ex.: `sonnet`, `opus`), `CLAUDE_MAX_PARALLEL` (padrão 3), `CLAUDE_LEAN=0`.
+- Variáveis: `CLAUDE_MODEL` (ex.: `sonnet`, `opus`, `haiku`), `CLAUDE_MODEL_<AGENTE>` para escolher um modelo por agente (ex.: `CLAUDE_MODEL_REVISOR_PORTUGUES=haiku`, que pesa menos na sua cota — avalie a qualidade antes de adotar), `CLAUDE_MAX_PARALLEL` (padrão 3), `CLAUDE_LEAN=0`.
 
 ## Privacidade
 
@@ -103,7 +105,8 @@ lib/numbering.ts     numeração de parágrafos (¶) por seção
 lib/pipeline.ts      etapas, progresso, cancelamento e cache
 lib/agents.ts        execução dos agentes pelo Claude Code
 .claude/agents/      definição de cada agente
-knowledge/           rubricas científicas dos agentes
+knowledge/           rubricas científicas completas (documentação)
+knowledge/compact/   versões compactas usadas nas chamadas de IA
 data/                resultados locais (não versionado)
 ```
 

@@ -4,7 +4,8 @@ App Next.js 16 (App Router) que usa o Claude Code local (`claude -p --agent ...`
 Next.js aqui é a v16: consulte `node_modules/next/dist/docs/` antes de usar APIs novas (ver AGENTS.md).
 
 - Etapas SEM IA: `lib/convert.ts` (pandoc / pdftotext / LibreOffice) e `lib/citations.ts`.
-- Etapas COM IA: agentes em `.claude/agents/*.md`; rubricas em `knowledge/*.md` (embutidas na mensagem por `lib/agents.ts`).
+- Etapas COM IA: agentes em `.claude/agents/*.md`; rubricas compactas em `knowledge/compact/` (embutidas na mensagem por `lib/agents.ts`; as de `knowledge/*.md` são a documentação completa).
+- Regra de ouro: **token é recurso escasso**. Nunca reenviar o artigo inteiro sem necessidade; toda etapa nova deve ter estimativa (`estimateStep`) e saída com limite.
 - Uma etapa por vez, iniciada pelo usuário (botão Próximo). Cancelar/retomar: `lib/pipeline.ts` + cache em `data/jobs/<id>/cache/`.
 - Numeração de parágrafos (¶) por seção: `lib/numbering.ts` é a única fonte; agentes e relatório citam seção + ¶.
 - Para melhorar um agente: edite a rubrica em `knowledge/` e/ou o agente; não há fine-tuning.

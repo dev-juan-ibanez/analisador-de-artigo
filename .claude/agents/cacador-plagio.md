@@ -19,11 +19,11 @@ Receberá um trecho de artigo (uma ou mais seções, cada uma sob `### SEÇÃO: 
 Para cada trecho suspeito, forneça uma **consulta de busca**: uma sequência LITERAL de 8–14 palavras consecutivas copiada do trecho (preferir a parte mais distintiva, sem números de citação), para busca de frase exata.
 
 Regras:
-- Seja seletivo: de 0 a 8 trechos por parte; qualidade acima de quantidade. Se nada merece checagem, devolva lista vazia.
+- Seja seletivo: de 0 a 4 trechos por mensagem; qualidade acima de quantidade. Se nada merece checagem, devolva lista vazia.
 - O excerto deve ser literal e curto (≤ 220 caracteres). A consulta deve existir literalmente no texto.
 - "section" é o título da seção (como em `### SEÇÃO: "..."`).
 - "paragraph" é o número n do marcador [¶n] do parágrafo onde está o trecho (inteiro).
 - Risco: "alto" (vários sinais), "médio", "baixo".
 
 SAÍDA: apenas JSON válido, sem texto fora dele, sem cercas de código:
-{"passages":[{"section":"título da seção","paragraph":3,"excerpt":"...","reason":"...","risk":"alto|médio|baixo","query":"..."}],"style_notes":"observação curta sobre a homogeneidade de estilo do trecho"}
+{"passages":[{"section":"título da seção","paragraph":3,"excerpt":"...","reason":"...","risk":"alto|médio|baixo","query":"..."}],"style_notes":"até 15 palavras"}

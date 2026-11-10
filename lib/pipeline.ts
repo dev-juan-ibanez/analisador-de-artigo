@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { CancelledError, isMock, runAgent, UsageLimitError, type AgentName } from "./agents";
+import { CancelledError, isMock, peekCache, promptOverheadChars, runAgent, UsageLimitError, type AgentName } from "./agents";
 import { splitSections } from "./convert";
-import { numberSections, type NumberedSection } from "./numbering";
+import { isAbstractTitle, numberSections, type NumberedSection } from "./numbering";
 import { splitBodyAndReferences, type CitationReport } from "./citations";
 import { endRun, jobFile, readOptional, registerRun, updateStep, ROOT, type StepId } from "./jobs";
 
@@ -28,12 +28,16 @@ type Ctx = {
   expectedChars: number; // tamanho típico da resposta de uma chamada (da última execução)
   maxFraction: number;
   lastPublish: number;
+  /** Simulação para estimar o gasto de tokens antes de rodar (não chama a IA nem grava nada). */
+  dry: boolean;
+  est: { tokens: number; calls: number };
 };
 
 let callSeq = 0;
 
 /** Publica o andamento real: partes concluídas + texto já gerado nas partes em curso (no máx. 1x/0,7 s). */
 async function publish(ctx: Ctx, force = false) {
+  if (ctx.dry) return;
   const now = Date.now();
   if (!force && now - ctx.lastPublish < 700) return;
   ctx.lastPublish = now;
@@ -57,6 +61,15 @@ async function publish(ctx: Ctx, force = false) {
 
 /** Chama um agente com cancelamento, cache de retomada, andamento real e parada imediata em caso de limite de uso. */
 async function ai(ctx: Ctx, agent: AgentName, prompt: string, opts: { timeoutMs?: number; rubrics?: string[] } = {}) {
+  if (ctx.dry) {
+    // Estimativa: entrada (mensagem + rubricas + agente) + saída típica; ~3,4 caracteres por token.
+    if (!(await peekCache(agent, prompt, { cacheDir: ctx.cacheDir, rubrics: opts.rubrics }))) {
+      const inChars = prompt.length + (await promptOverheadChars(agent, opts.rubrics));
+      ctx.est.tokens += Math.round((inChars + ctx.expectedChars) / 3.4);
+      ctx.est.calls++;
+    }
+    return "";
+  }
   const callId = ++callSeq;
   try {
     const out = await runAgent(agent, prompt, {
@@ -100,6 +113,9 @@ async function pool<T>(ctx: Ctx, tasks: Array<() => Promise<T>>): Promise<T[]> {
     }),
   );
 }
+
+/** Grava o resultado da etapa (não faz nada na simulação de estimativa). */
+const put = (ctx: Ctx, name: string, content: string) => (ctx.dry ? Promise.resolve() : fs.writeFile(jobFile(ctx.id, name), content));
 
 // ---------- Agrupamento de seções em chamadas ----------
 
@@ -181,55 +197,38 @@ const fileBlock = (name: string, text: string | null) => (text ? `<ARQUIVO nome=
 
 // ---------- Etapas ----------
 
-const LANGS = [
-  { key: "pt", re: /^resumo\b/i, nome: "Resumo (português)", idioma: "português do Brasil" },
-  { key: "en", re: /^abstract\b/i, nome: "Abstract (inglês)", idioma: "inglês" },
-  { key: "es", re: /^resumen\b/i, nome: "Resumen (español)", idioma: "espanhol" },
-] as const;
+/** Seções cujo texto é, em geral, dado próprio do autor: a busca de plágio as ignora (economia de tokens). */
+const OWN_DATA_SECTIONS = /m[eé]todo|metodologia|resultado|apresenta[cç][aã]o d[oe]s dados|an[aá]lise d[oe]s dados/i;
 
 async function stepResumos(ctx: Ctx) {
   const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
   const all = numberSections(md);
-  const found = LANGS.map((l) => ({ ...l, sec: all.find((s) => l.re.test(s.title) && s.paras.length) }));
-  if (!found.some((f) => f.sec)) {
+  const abs = all.filter((s) => isAbstractTitle(s.title) && s.paras.length);
+  if (!abs.length) {
     ctx.total = 1;
     ctx.completed = 1;
     await publish(ctx, true);
-    await fs.writeFile(
-      jobFile(ctx.id, "resumos.md"),
+    await put(
+      ctx,
+      "resumos.md",
       "# Resumos (PT · EN · ES)\n\n🔴 Não encontrei as seções **Resumo**, **Abstract** ou **Resumen** no texto convertido. Verifique a conversão (botão Texto numerado) ou se o artigo as possui.\n",
     );
     return;
   }
   const marked = (s: NumberedSection) =>
     `### SEÇÃO: "${s.title}"\n\n${s.paras.map((p, i) => `[¶${i + 1}] ${p}`).join("\n\n")}`;
-  const abstracts = found.filter((f) => f.sec).map((f) => marked(f.sec!)).join("\n\n");
   const pick = (re: RegExp, n: number) => {
     const s = all.find((x) => re.test(x.title));
-    return s ? `#### ${s.title}\n${s.text.slice(0, n)}` : "";
+    return s ? `#### ${s.title}\n${s.text.slice(0, n).replace(/\s+/g, " ")}` : "";
   };
-  const body = [pick(/introdu/i, 2000), pick(/resultad/i, 3000), pick(/conclus/i, 2000)].filter(Boolean).join("\n\n");
-  const missing = found.filter((f) => !f.sec).map((f) => f.nome);
-
-  // Uma chamada por idioma, em paralelo: mais rápido e com andamento real.
-  const results = await pool(
-    ctx,
-    found.map((f) => async () => {
-      if (!f.sec) return `## ${f.nome}\n\n🔴 Versão **não encontrada** no artigo.`;
-      const extra =
-        f.key === "pt"
-          ? `\n\nTRECHOS DO CORPO DO ARTIGO (confira se o resumo é sustentado por eles):\n\n${body}`
-          : "";
-      return ai(
-        ctx,
-        "revisor-resumos",
-        `REVISE SOMENTE a versão: ${f.nome} (${f.idioma}). Use o título de seção "## ${f.nome}".\nAs três versões do artigo (para conferir a fidelidade):\n\n${abstracts}${extra}`,
-        { rubrics: f.key === "pt" ? ["05-resumo-pt-en-es.md", "02-portugues-academico.md"] : ["05-resumo-pt-en-es.md"] },
-      );
-    }),
-  );
+  const body = [pick(/resultad/i, 1200), pick(/conclus/i, 800)].filter(Boolean).join("\n\n");
+  const have = { pt: abs.some((s) => /^resumo/i.test(s.title)), en: abs.some((s) => /^abstract/i.test(s.title)), es: abs.some((s) => /^resumen/i.test(s.title)) };
+  const missing = [!have.pt && "Resumo", !have.en && "Abstract", !have.es && "Resumen"].filter(Boolean);
+  const [r] = await pool(ctx, [
+    () => ai(ctx, "revisor-resumos", `${abs.map(marked).join("\n\n")}\n\nTRECHOS DO CORPO (para conferir se o resumo é sustentado):\n\n${body}`),
+  ]);
   const note = missing.length ? `\n> ⚠️ Versão(ões) não encontrada(s): ${missing.join(", ")}.\n` : "";
-  await fs.writeFile(jobFile(ctx.id, "resumos.md"), `# Resumos (PT · EN · ES)\n${note}\n${results.join("\n\n---\n\n")}\n`);
+  await put(ctx, "resumos.md", `# Resumos (PT · EN · ES)\n${note}\n${r}\n`);
 }
 
 async function stepPortugues(ctx: Ctx) {
@@ -237,33 +236,25 @@ async function stepPortugues(ctx: Ctx) {
   const results = await pool(
     ctx,
     chunks.map((c) => async () => {
-      const r = await ai(
-        ctx,
-        "revisor-portugues",
-        `Revise o português do trecho abaixo. ${MARKS} O trecho contém uma ou mais seções (### SEÇÃO). Em cada achado informe a seção e o ¶.\n\n---\n${c.text}---`,
-      );
+      const r = await ai(ctx, "revisor-portugues", `${MARKS}\n\n${c.text}`);
       return `## ${c.label}\n\n${r}`;
     }),
   );
-  await fs.writeFile(jobFile(ctx.id, "portugues.md"), `# Revisão de português\n\n${results.join("\n\n---\n\n")}\n`);
+  await put(ctx, "portugues.md", `# Revisão de português\n\n${results.join("\n\n")}\n`);
 }
 
 async function stepSecoes(ctx: Ctx) {
   const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
-  const context = md.slice(0, 3500);
+  const context = splitBodyAndReferences(md).body.slice(0, 700).replace(/\s+/g, " ");
   const chunks = packChunks(await getSections(ctx.id));
   const results = await pool(
     ctx,
     chunks.map((c) => async () => {
-      const r = await ai(
-        ctx,
-        "analista-secao",
-        `CONTEXTO DO ARTIGO (início do texto, para referência):\n---\n${context}\n---\n\nSEÇÕES A ANALISAR. ${MARKS} Analise CADA seção (### SEÇÃO) separadamente, com um bloco próprio por seção, e informe o ¶ em cada problema.\n---\n${c.text}---`,
-      );
+      const r = await ai(ctx, "analista-secao", `CONTEXTO (início do artigo): ${context}\n\n${MARKS}\n\n${c.text}`);
       return `## ${c.label}\n\n${r}`;
     }),
   );
-  await fs.writeFile(jobFile(ctx.id, "secoes.md"), `# Análise seção a seção\n\n${results.join("\n\n---\n\n")}\n`);
+  await put(ctx, "secoes.md", `# Análise seção a seção\n\n${results.join("\n\n")}\n`);
 }
 
 function outlineMarkdown(md: string) {
@@ -279,19 +270,16 @@ function outlineMarkdown(md: string) {
 
 async function stepEstrutura(ctx: Ctx) {
   const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
-  const body = await articleBody(ctx.id);
+  const body = splitBodyAndReferences(md).body;
+  // Só o esqueleto e o começo de cada seção (~250 caracteres): o texto inteiro não é necessário para avaliar a divisão.
+  const starts = splitSections(body)
+    .filter((s) => s.text.trim())
+    .map((s) => `### ${s.title}\n${s.text.slice(0, 250).replace(/\s+/g, " ")}…`)
+    .join("\n\n");
   const [r] = await pool(ctx, [
-    () =>
-      ai(
-        ctx,
-        "analista-estrutura",
-        `ESQUELETO (extraído automaticamente do artigo):\n\n${outlineMarkdown(md)}\n\nTEXTO DO ARTIGO (sem a lista de referências):\n\n${body}`,
-      ),
+    () => ai(ctx, "analista-estrutura", `ESQUELETO (automático):\n\n${outlineMarkdown(md)}\n\nINÍCIO DE CADA SEÇÃO:\n\n${starts}`),
   ]);
-  await fs.writeFile(
-    jobFile(ctx.id, "estrutura.md"),
-    `# Estrutura do artigo\n\n## Esqueleto detectado\n\n${outlineMarkdown(md)}\n\n---\n\n${r}\n`,
-  );
+  await put(ctx, "estrutura.md", `# Estrutura do artigo\n\n## Esqueleto detectado\n\n${outlineMarkdown(md)}\n\n---\n\n${r}\n`);
 }
 
 type Passage = { excerpt: string; reason: string; risk: string; query: string; section?: string; paragraph?: number };
@@ -309,15 +297,25 @@ function parsePassages(text: string): { passages: Passage[]; notes: string } {
 }
 
 async function stepPlagio(ctx: Ctx) {
-  const chunks = packChunks(await getSections(ctx.id));
+  const every = await getSections(ctx.id);
+  // Ignora Métodos/Resultados e TODAS as suas subseções (dados próprios do autor).
+  let skipLevel = 0;
+  const sections = every.filter((s) => {
+    if (skipLevel && s.level > skipLevel) return false;
+    skipLevel = 0;
+    if (OWN_DATA_SECTIONS.test(s.title)) {
+      skipLevel = s.level;
+      return false;
+    }
+    return true;
+  });
+  const skipped = every.filter((s) => !sections.includes(s)).map((s) => s.title);
+  if (!sections.length) sections.push(...every);
+  const chunks = packChunks(sections);
   const parsed = await pool(
     ctx,
     chunks.map((c) => async () => {
-      const r = await ai(
-        ctx,
-        "cacador-plagio",
-        `${MARKS} O trecho contém uma ou mais seções (### SEÇÃO). Para cada trecho suspeito informe em "section" o título da seção e em "paragraph" o número do ¶.\n\n---\n${c.text}---`,
-      );
+      const r = await ai(ctx, "cacador-plagio", `${MARKS} Informe "section" e "paragraph" de cada trecho.\n\n${c.text}`);
       return { label: c.label, ...parsePassages(r) };
     }),
   );
@@ -328,6 +326,9 @@ async function stepPlagio(ctx: Ctx) {
     "# Trechos para checar possível plágio",
     "",
     "> ⚠️ Esta lista **não** prova plágio: a IA não consulta bases de comparação. São trechos com sinais (mudança de estilo, texto de manual, afirmações sem fonte etc.) para você **pesquisar**. Para verificação formal use Turnitin, iThenticate ou Copyleaks (ou a ferramenta da sua instituição).",
+    "",
+    `Seções analisadas: ${sections.map((s) => s.title).join("; ")}.` +
+      (skipped.length ? ` Não analisadas (em geral são dados próprios do autor): ${skipped.join("; ")}.` : ""),
     "",
     `Trechos sinalizados: **${all.length}**`,
     "",
@@ -347,42 +348,47 @@ async function stepPlagio(ctx: Ctx) {
   });
   const notes = parsed.filter((p) => p.notes).map((p) => `- **${p.label}:** ${p.notes}`);
   if (notes.length) L.push("## Homogeneidade de estilo", "", ...notes);
-  await fs.writeFile(jobFile(ctx.id, "plagio.md"), L.join("\n") + "\n");
+  await put(ctx, "plagio.md", L.join("\n") + "\n");
 }
 
+/** Avaliação geral + indícios de IA numa única leitura do artigo. */
 async function stepGeral(ctx: Ctx) {
   const body = await articleBody(ctx.id);
   const cit = await citationSummary(ctx.id);
   const estrutura = await readOptional(ctx.id, "estrutura.md");
-  const context = `CRUZAMENTO DE CITAÇÕES (automático):\n${cit}\n\n${fileBlock("estrutura.md", estrutura)}`;
-  const [geral, ia] = await pool(ctx, [
-    () => ai(ctx, "revisor-geral", `${context}\n\nTEXTO DO ARTIGO (sem a lista de referências):\n\n${body}`),
-    () => ai(ctx, "detector-ia", `CRUZAMENTO DE CITAÇÕES (automático):\n${cit}\n\nTEXTO DO ARTIGO (sem a lista de referências):\n\n${body}`),
+  const [out] = await pool(ctx, [
+    () =>
+      ai(
+        ctx,
+        "revisor-geral",
+        `CRUZAMENTO DE CITAÇÕES (automático):\n${cit}\n\n${fileBlock("estrutura.md", estrutura)}\n\nTEXTO DO ARTIGO (sem a lista de referências):\n\n${body}`,
+      ),
   ]);
-  await fs.writeFile(jobFile(ctx.id, "geral.md"), `# Avaliação geral\n\n${geral}\n`);
-  await fs.writeFile(jobFile(ctx.id, "ia.md"), `# Indícios de IA\n\n${ia}\n`);
+  const cut = out.search(/^#{1,3}\s*Ind[ií]cios de IA/im);
+  const geral = (cut >= 0 ? out.slice(0, cut) : out).replace(/^#{1,3}\s*Avalia[cç][aã]o geral\s*/i, "").trim();
+  const ia = cut >= 0 ? out.slice(cut).replace(/^#{1,3}\s*Ind[ií]cios de IA\s*/i, "").trim() : "(o agente não separou a seção de indícios de IA)";
+  await put(ctx, "geral.md", `# Avaliação geral\n\n${geral}\n`);
+  await put(ctx, "ia.md", `# Indícios de IA\n\n${ia}\n`);
 }
 
+/** O relatório consolida SÓ as análises já feitas (elas trazem seção, ¶ e trecho): o artigo não é reenviado. */
 async function stepRelatorio(ctx: Ctx) {
   const names = ["resumos.md", "portugues.md", "estrutura.md", "secoes.md", "plagio.md", "geral.md", "ia.md"];
-  const blocks: string[] = [];
-  // numerado.md = artigo inteiro com ¶ (sem a lista de referências, que vai no resumo de citações)
-  const numerado = (await readOptional(ctx.id, "numerado.md")) ?? "";
-  blocks.push(fileBlock("numerado.md", numerado.split(/\n## Referências\n/)[0]));
-  blocks.push(fileBlock("citacoes (resumo automático)", await citationSummary(ctx.id)));
+  const blocks: string[] = [fileBlock("citacoes (resumo automático)", await citationSummary(ctx.id))];
   const missing: string[] = [];
   for (const n of names) {
     const t = await readOptional(ctx.id, n);
     if (t) blocks.push(fileBlock(n, t));
     else missing.push(n);
   }
+  if (ctx.dry) ctx.est.tokens += missing.length * 1500; // etapas ainda não feitas: tamanho típico
   const note = missing.length ? `\n\nArquivos NÃO disponíveis (etapas não executadas): ${missing.join(", ")}.` : "";
   const [report] = await pool(ctx, [
     () => ai(ctx, "redator-relatorio", `Escreva o relatório final com base nos arquivos abaixo.${note}\n\n${blocks.filter(Boolean).join("\n\n")}`, { timeoutMs: 15 * 60 * 1000 }),
   ]);
   // Remove qualquer frase solta do agente antes do título do relatório.
   const start = report.search(/^# /m);
-  await fs.writeFile(jobFile(ctx.id, "relatorio.md"), (start > 0 ? report.slice(start) : report) + "\n");
+  await put(ctx, "relatorio.md", (start > 0 ? report.slice(start) : report) + "\n");
 }
 
 const RUNNERS: Partial<Record<StepId, (ctx: Ctx) => Promise<void>>> = {
@@ -409,13 +415,13 @@ const OUTPUTS: Partial<Record<StepId, string[]>> = {
 // Aprende com a última execução real (a simulação não registra).
 const TIMINGS = path.join(ROOT, "data", "timings.json");
 const DEFAULT_CHARS: Partial<Record<StepId, number>> = {
-  resumos: 3500,
-  portugues: 6000,
-  estrutura: 7000,
-  secoes: 7000,
-  plagio: 2500,
-  geral: 9000,
-  relatorio: 18000,
+  resumos: 2800,
+  portugues: 2200,
+  estrutura: 3000,
+  secoes: 2600,
+  plagio: 1000,
+  geral: 5500,
+  relatorio: 11000,
 };
 async function expectedChars(step: StepId) {
   try {
@@ -461,6 +467,8 @@ export async function runStep(id: string, step: StepId, opts: { force?: boolean 
     expectedChars: await expectedChars(step),
     maxFraction: 0,
     lastPublish: 0,
+    dry: false,
+    est: { tokens: 0, calls: 0 },
   };
   const started = Date.now();
   try {
@@ -514,4 +522,34 @@ export async function runStep(id: string, step: StepId, opts: { force?: boolean 
   } finally {
     endRun(id, step);
   }
+}
+
+/** Estimativa (sem chamar a IA) de quantos tokens a etapa deve usar. Já desconta o que está guardado no cache. */
+export async function estimateStep(id: string, step: StepId): Promise<{ tokens: number; calls: number } | null> {
+  const fn = RUNNERS[step];
+  if (!fn) return null;
+  const ctx: Ctx = {
+    id,
+    step,
+    signal: new AbortController().signal,
+    cacheDir: jobFile(id, `cache/${step}`),
+    abort: () => {},
+    total: 0,
+    completed: 0,
+    tokens: 0,
+    doneChars: 0,
+    calls: 0,
+    inflight: new Map(),
+    expectedChars: await expectedChars(step),
+    maxFraction: 0,
+    lastPublish: 0,
+    dry: true,
+    est: { tokens: 0, calls: 0 },
+  };
+  try {
+    await fn(ctx);
+  } catch {
+    return null;
+  }
+  return ctx.est;
 }
