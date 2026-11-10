@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { CancelledError, isMock, peekCache, promptOverheadChars, runAgent, UsageLimitError, type AgentName } from "./agents";
+import { CancelledError, definitionHash, isMock, peekCache, promptOverheadChars, runAgent, UsageLimitError, type AgentName } from "./agents";
 import { splitSections } from "./convert";
 import { isAbstractTitle, numberSections, type NumberedSection } from "./numbering";
 import { splitBodyAndReferences, type CitationReport } from "./citations";
@@ -60,10 +61,16 @@ async function publish(ctx: Ctx, force = false) {
 }
 
 /** Chama um agente com cancelamento, cache de retomada, andamento real e parada imediata em caso de limite de uso. */
-async function ai(ctx: Ctx, agent: AgentName, prompt: string, opts: { timeoutMs?: number; rubrics?: string[] } = {}) {
+async function ai(
+  ctx: Ctx,
+  agent: AgentName,
+  prompt: string,
+  opts: { timeoutMs?: number; rubrics?: string[]; cache?: string; validate?: (out: string) => void } = {},
+) {
+  const cacheDir = opts.cache ? jobFile(ctx.id, `cache/${opts.cache}`) : ctx.cacheDir;
   if (ctx.dry) {
     // Estimativa: entrada (mensagem + rubricas + agente) + saída típica; ~3,4 caracteres por token.
-    if (!(await peekCache(agent, prompt, { cacheDir: ctx.cacheDir, rubrics: opts.rubrics }))) {
+    if (!(await peekCache(agent, prompt, { cacheDir, rubrics: opts.rubrics }))) {
       const inChars = prompt.length + (await promptOverheadChars(agent, opts.rubrics));
       ctx.est.tokens += Math.round((inChars + ctx.expectedChars) / 3.4);
       ctx.est.calls++;
@@ -74,9 +81,10 @@ async function ai(ctx: Ctx, agent: AgentName, prompt: string, opts: { timeoutMs?
   try {
     const out = await runAgent(agent, prompt, {
       signal: ctx.signal,
-      cacheDir: ctx.cacheDir,
+      cacheDir,
       timeoutMs: opts.timeoutMs,
       rubrics: opts.rubrics,
+      validate: opts.validate,
       onProgress: (c) => {
         ctx.inflight.set(callId, c);
         void publish(ctx);
@@ -188,17 +196,9 @@ async function citationSummary(id: string): Promise<string> {
   }
 }
 
-/** Corpo do artigo sem a lista de referências (economiza tokens). */
-async function articleBody(id: string) {
-  return splitBodyAndReferences(await fs.readFile(jobFile(id, "article.md"), "utf8")).body;
-}
-
 const fileBlock = (name: string, text: string | null) => (text ? `<ARQUIVO nome="${name}">\n${text.trim()}\n</ARQUIVO>` : "");
 
 // ---------- Etapas ----------
-
-/** Seções cujo texto é, em geral, dado próprio do autor: a busca de plágio as ignora (economia de tokens). */
-const OWN_DATA_SECTIONS = /m[eé]todo|metodologia|resultado|apresenta[cç][aã]o d[oe]s dados|an[aá]lise d[oe]s dados/i;
 
 async function stepResumos(ctx: Ctx) {
   const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
@@ -231,30 +231,201 @@ async function stepResumos(ctx: Ctx) {
   await put(ctx, "resumos.md", `# Resumos (PT · EN · ES)\n${note}\n${r}\n`);
 }
 
-async function stepPortugues(ctx: Ctx) {
-  const chunks = packChunks(await getSections(ctx.id));
-  const results = await pool(
+// ---------- Leitura integrada: UMA leitura de cada trecho, reaproveitada por várias etapas ----------
+// Português, Seções, Plágio (e as sínteses usadas por Geral/Relatório) saem da MESMA chamada por trecho.
+// O resultado fica em leitura.json; as etapas seguintes só o exibem (custo zero).
+
+type Row3 = [string, number, string, string, string];
+type Leitura = {
+  pt: Row3[]; // [seção, ¶, sev, trecho, correção]
+  sc: { s: string; v: string; p: [number, string, string, string][] }[]; // por seção
+  pl: [string, number, string, string, string, string][]; // [seção, ¶, risco, trecho, motivo, consulta]
+  dg: [string, string][]; // [seção, síntese]
+  ia: [string, number, string, string][]; // [seção, ¶, sinal, trecho]
+};
+const emptyLeitura = (): Leitura => ({ pt: [], sc: [], pl: [], dg: [], ia: [] });
+
+function parseLeitura(text: string): Leitura {
+  const a = text.indexOf("{");
+  const b = text.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("Resposta do agente sem JSON.");
+  let j: Record<string, unknown>;
+  try {
+    j = JSON.parse(text.slice(a, b + 1));
+  } catch {
+    throw new Error("Resposta do agente com JSON inválido.");
+  }
+  const list = (x: unknown) => (Array.isArray(x) ? x : []);
+  return {
+    pt: list(j.pt).filter(Array.isArray) as Leitura["pt"],
+    sc: list(j.sc).filter((x) => x && typeof x === "object") as Leitura["sc"],
+    pl: list(j.pl).filter(Array.isArray) as Leitura["pl"],
+    dg: list(j.dg).filter(Array.isArray) as Leitura["dg"],
+    ia: list(j.ia).filter(Array.isArray) as Leitura["ia"],
+  };
+}
+
+type Saved = { key: string; order: string[]; data: Leitura };
+
+async function loadLeitura(id: string): Promise<Saved | null> {
+  try {
+    return JSON.parse(await fs.readFile(jobFile(id, "leitura.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Devolve a leitura já feita; só chama a IA se ainda não existir (ou se o texto/agente mudou). */
+async function getLeitura(ctx: Ctx): Promise<Saved> {
+  const sections = await getSections(ctx.id);
+  const order = sections.map((s) => s.title);
+  const chunks = packChunks(sections);
+  const key = createHash("sha1")
+    .update(chunks.map((c) => c.text).join("\0"))
+    .update(await definitionHash("revisor-texto"))
+    .update(isMock() ? "MOCK" : "REAL") // leitura simulada nunca vale para uma execução real
+    .digest("hex");
+  const saved = await loadLeitura(ctx.id);
+  if (saved && saved.key === key) {
+    ctx.total = 1;
+    ctx.completed = 1;
+    await publish(ctx, true);
+    return saved; // já lido: nenhuma chamada de IA
+  }
+  const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
+  const title = /^#\s+(.+)$/m.exec(md)?.[1]?.replace(/[*_]/g, "").trim() ?? "(sem título)";
+  const parts = await pool(
     ctx,
     chunks.map((c) => async () => {
-      const r = await ai(ctx, "revisor-portugues", `${MARKS}\n\n${c.text}`);
-      return `## ${c.label}\n\n${r}`;
+      const out = await ai(ctx, "revisor-texto", `TÍTULO DO ARTIGO: ${title}\n${MARKS}\n\n${c.text}`, {
+        cache: "leitura",
+        validate: (o) => void parseLeitura(o),
+      });
+      return ctx.dry ? emptyLeitura() : parseLeitura(out);
     }),
   );
-  await put(ctx, "portugues.md", `# Revisão de português\n\n${results.join("\n\n")}\n`);
+  const data = emptyLeitura();
+  for (const x of parts) {
+    data.pt.push(...x.pt);
+    data.sc.push(...x.sc);
+    data.pl.push(...x.pl);
+    data.dg.push(...x.dg);
+    data.ia.push(...x.ia);
+  }
+  const result: Saved = { key, order, data };
+  if (!ctx.dry) await fs.writeFile(jobFile(ctx.id, "leitura.json"), JSON.stringify(result));
+  return result;
+}
+
+// ---- apresentação (feita pelo código: sem tokens) ----
+const SEV = { A: "🔴", B: "🟠", C: "🟡" } as const;
+type SevKey = keyof typeof SEV;
+const sevOf = (x: unknown): SevKey => (["A", "B", "C"].includes(String(x).toUpperCase()) ? (String(x).toUpperCase() as SevKey) : "C");
+const VERDICT: Record<string, string> = { A: "Adequada", B: "Ajustes menores", C: "Revisão substancial", D: "Inadequada" };
+const cell = (x: unknown) => String(x ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+const norm = (t: string) => t.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/** Casa o nome de seção devolvido pelo agente com o título real do documento. */
+function canon(order: string[], name: unknown): string {
+  const n = norm(String(name ?? ""));
+  return order.find((t) => norm(t) === n) ?? order.find((t) => n && (norm(t).includes(n) || n.includes(norm(t)))) ?? String(name ?? "(sem seção)");
+}
+
+type Row = { sec: string; par: number; sev: SevKey; tipo: "Português" | "Conteúdo"; trecho: string; txt: string };
+
+function rowsOf(L: Leitura, order: string[]): { rows: Row[]; verdict: Map<string, string> } {
+  const rows: Row[] = [];
+  const verdict = new Map<string, string>();
+  for (const r of L.pt) rows.push({ sec: canon(order, r[0]), par: Number(r[1]) || 0, sev: sevOf(r[2]), tipo: "Português", trecho: String(r[3] ?? ""), txt: String(r[4] ?? "") });
+  for (const sc of L.sc) {
+    const sec = canon(order, sc.s);
+    const v = String(sc.v ?? "").toUpperCase();
+    if (v && (!verdict.has(sec) || v > (verdict.get(sec) ?? ""))) verdict.set(sec, v); // pior veredito entre trechos
+    for (const p of Array.isArray(sc.p) ? sc.p : [])
+      rows.push({ sec, par: Number(p[0]) || 0, sev: sevOf(p[1]), tipo: "Conteúdo", trecho: String(p[2] ?? ""), txt: String(p[3] ?? "") });
+  }
+  return { rows, verdict };
+}
+
+const bySection = (order: string[], rows: Row[]) => {
+  const secs = [...order, ...rows.map((r) => r.sec).filter((s) => !order.includes(s))];
+  return [...new Set(secs)].map((sec) => ({ sec, rows: rows.filter((r) => r.sec === sec).sort((a, b) => a.par - b.par || a.sev.localeCompare(b.sev)) }));
+};
+
+function table(rows: Row[], withTipo: boolean) {
+  const head = withTipo ? "| ¶ | Sev. | Tipo | Trecho (marcar em vermelho) | O que corrigir |\n|---|---|---|---|---|" : "| ¶ | Sev. | Trecho | O que corrigir |\n|---|---|---|---|";
+  const body = rows.map((r) => (withTipo ? `| ${r.par || "geral"} | ${SEV[r.sev]} | ${r.tipo} | ${cell(r.trecho)} | ${cell(r.txt)} |` : `| ${r.par || "geral"} | ${SEV[r.sev]} | ${cell(r.trecho)} | ${cell(r.txt)} |`));
+  return `${head}\n${body.join("\n")}`;
+}
+
+const countLine = (rows: Row[]) =>
+  (["A", "B", "C"] as SevKey[]).map((k) => `${SEV[k]} ${rows.filter((r) => r.sev === k).length}`).join("  ");
+
+function renderPortugues(saved: Saved) {
+  const { rows } = rowsOf(saved.data, saved.order);
+  const pt = rows.filter((r) => r.tipo === "Português");
+  const L = ["# Revisão de português", "", `Achados: **${pt.length}** (${countLine(pt)})`, ""];
+  for (const g of bySection(saved.order, pt)) {
+    L.push(`## ${g.sec}`, "", g.rows.length ? table(g.rows, false) : "Sem correções relevantes.", "");
+  }
+  return L.join("\n");
+}
+
+function renderSecoes(saved: Saved) {
+  const { rows, verdict } = rowsOf(saved.data, saved.order);
+  const ct = rows.filter((r) => r.tipo === "Conteúdo");
+  const L = ["# Análise seção a seção", ""];
+  for (const g of bySection(saved.order, ct)) {
+    const v = VERDICT[verdict.get(g.sec) ?? ""] ?? "—";
+    L.push(`### ${g.sec} — ${v}`, "", g.rows.length ? table(g.rows, false) : "Sem problemas relevantes.", "");
+  }
+  return L.join("\n");
+}
+
+const RISK: Record<string, string> = { A: "alto", M: "médio", B: "baixo" };
+const gq = (s: string) => encodeURIComponent(`"${s.replace(/["“”]/g, "").trim()}"`);
+
+function plagioItems(saved: Saved) {
+  const rank: Record<string, number> = { A: 0, M: 1, B: 2 };
+  return saved.data.pl
+    .map((r) => ({ sec: canon(saved.order, r[0]), par: Number(r[1]) || 0, risk: String(r[2] ?? "B").toUpperCase(), trecho: String(r[3] ?? ""), motivo: String(r[4] ?? ""), q: String(r[5] ?? "") }))
+    .sort((a, b) => (rank[a.risk] ?? 3) - (rank[b.risk] ?? 3));
+}
+
+function renderPlagio(saved: Saved) {
+  const items = plagioItems(saved);
+  const L = [
+    "# Trechos para checar possível plágio",
+    "",
+    "> ⚠️ Esta lista **não** prova plágio: a IA não consulta bases de comparação. São trechos com sinais (mudança de estilo, texto de manual, afirmações sem fonte etc.) para você **pesquisar**. Para verificação formal use Turnitin, iThenticate ou Copyleaks (ou a ferramenta da sua instituição).",
+    "",
+    `Trechos sinalizados: **${items.length}**`,
+    "",
+  ];
+  items.forEach((p, i) => {
+    L.push(
+      `### ${i + 1}. [${RISK[p.risk] ?? p.risk}] ${p.sec}${p.par ? `, ¶${p.par}` : ""}`,
+      `> ${p.trecho}`,
+      "",
+      `**Por que suspeito:** ${p.motivo}`,
+      "",
+      p.q
+        ? `**Pesquisar:** [Google (frase exata)](https://www.google.com/search?q=${gq(p.q)}) · [Scholar](https://scholar.google.com/scholar?q=${gq(p.q)}) · [Google Livros](https://www.google.com/search?tbm=bks&q=${gq(p.q)})  \nFrase: \`${p.q}\``
+        : "",
+      "",
+    );
+  });
+  return L.join("\n");
+}
+
+async function stepPortugues(ctx: Ctx) {
+  const saved = await getLeitura(ctx);
+  await put(ctx, "portugues.md", renderPortugues(saved) + "\n");
 }
 
 async function stepSecoes(ctx: Ctx) {
-  const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
-  const context = splitBodyAndReferences(md).body.slice(0, 700).replace(/\s+/g, " ");
-  const chunks = packChunks(await getSections(ctx.id));
-  const results = await pool(
-    ctx,
-    chunks.map((c) => async () => {
-      const r = await ai(ctx, "analista-secao", `CONTEXTO (início do artigo): ${context}\n\n${MARKS}\n\n${c.text}`);
-      return `## ${c.label}\n\n${r}`;
-    }),
-  );
-  await put(ctx, "secoes.md", `# Análise seção a seção\n\n${results.join("\n\n")}\n`);
+  const saved = await getLeitura(ctx);
+  await put(ctx, "secoes.md", renderSecoes(saved) + "\n");
 }
 
 function outlineMarkdown(md: string) {
@@ -282,86 +453,26 @@ async function stepEstrutura(ctx: Ctx) {
   await put(ctx, "estrutura.md", `# Estrutura do artigo\n\n## Esqueleto detectado\n\n${outlineMarkdown(md)}\n\n---\n\n${r}\n`);
 }
 
-type Passage = { excerpt: string; reason: string; risk: string; query: string; section?: string; paragraph?: number };
-
-function parsePassages(text: string): { passages: Passage[]; notes: string } {
-  const a = text.indexOf("{");
-  const b = text.lastIndexOf("}");
-  if (a < 0 || b <= a) return { passages: [], notes: "" };
-  try {
-    const j = JSON.parse(text.slice(a, b + 1));
-    return { passages: Array.isArray(j.passages) ? j.passages : [], notes: j.style_notes ?? "" };
-  } catch {
-    return { passages: [], notes: "(resposta do agente não pôde ser lida como JSON)" };
-  }
-}
-
 async function stepPlagio(ctx: Ctx) {
-  const every = await getSections(ctx.id);
-  // Ignora Métodos/Resultados e TODAS as suas subseções (dados próprios do autor).
-  let skipLevel = 0;
-  const sections = every.filter((s) => {
-    if (skipLevel && s.level > skipLevel) return false;
-    skipLevel = 0;
-    if (OWN_DATA_SECTIONS.test(s.title)) {
-      skipLevel = s.level;
-      return false;
-    }
-    return true;
-  });
-  const skipped = every.filter((s) => !sections.includes(s)).map((s) => s.title);
-  if (!sections.length) sections.push(...every);
-  const chunks = packChunks(sections);
-  const parsed = await pool(
-    ctx,
-    chunks.map((c) => async () => {
-      const r = await ai(ctx, "cacador-plagio", `${MARKS} Informe "section" e "paragraph" de cada trecho.\n\n${c.text}`);
-      return { label: c.label, ...parsePassages(r) };
-    }),
-  );
-  const rank: Record<string, number> = { alto: 0, médio: 1, medio: 1, baixo: 2 };
-  const all = parsed.flatMap((p) => p.passages).sort((a, b) => (rank[a.risk] ?? 3) - (rank[b.risk] ?? 3));
-  const q = (s: string) => encodeURIComponent(`"${s.replace(/["“”]/g, "").trim()}"`);
-  const L: string[] = [
-    "# Trechos para checar possível plágio",
-    "",
-    "> ⚠️ Esta lista **não** prova plágio: a IA não consulta bases de comparação. São trechos com sinais (mudança de estilo, texto de manual, afirmações sem fonte etc.) para você **pesquisar**. Para verificação formal use Turnitin, iThenticate ou Copyleaks (ou a ferramenta da sua instituição).",
-    "",
-    `Seções analisadas: ${sections.map((s) => s.title).join("; ")}.` +
-      (skipped.length ? ` Não analisadas (em geral são dados próprios do autor): ${skipped.join("; ")}.` : ""),
-    "",
-    `Trechos sinalizados: **${all.length}**`,
-    "",
-  ];
-  all.forEach((p, i) => {
-    L.push(
-      `### ${i + 1}. [${p.risk}] ${p.section ?? ""}${p.paragraph ? `, ¶${p.paragraph}` : ""}`,
-      `> ${p.excerpt}`,
-      "",
-      `**Por que suspeito:** ${p.reason}`,
-      "",
-      p.query
-        ? `**Pesquisar:** [Google (frase exata)](https://www.google.com/search?q=${q(p.query)}) · [Scholar](https://scholar.google.com/scholar?q=${q(p.query)}) · [Google Livros](https://www.google.com/search?tbm=bks&q=${q(p.query)})  \nFrase: \`${p.query}\``
-        : "",
-      "",
-    );
-  });
-  const notes = parsed.filter((p) => p.notes).map((p) => `- **${p.label}:** ${p.notes}`);
-  if (notes.length) L.push("## Homogeneidade de estilo", "", ...notes);
-  await put(ctx, "plagio.md", L.join("\n") + "\n");
+  const saved = await getLeitura(ctx);
+  await put(ctx, "plagio.md", renderPlagio(saved) + "\n");
 }
 
-/** Avaliação geral + indícios de IA numa única leitura do artigo. */
+/** Avaliação geral + indícios de IA a partir das sínteses da leitura integrada (o artigo NÃO é relido). */
 async function stepGeral(ctx: Ctx) {
-  const body = await articleBody(ctx.id);
+  const saved = await getLeitura(ctx);
+  const { rows } = rowsOf(saved.data, saved.order);
+  const digest = saved.data.dg.map((d) => `- **${canon(saved.order, d[0])}**: ${cell(d[1])}`).join("\n");
+  const sinais = saved.data.ia.map((r) => `- ${canon(saved.order, r[0])} ¶${r[1]}: ${cell(r[2])} — "${cell(r[3])}"`).join("\n");
+  const counts = bySection(saved.order, rows).map((g) => `- ${g.sec}: ${countLine(g.rows)}`).join("\n");
   const cit = await citationSummary(ctx.id);
-  const estrutura = await readOptional(ctx.id, "estrutura.md");
+  const estrutura = ((await readOptional(ctx.id, "estrutura.md")) ?? "").split("\n---\n").pop() ?? "";
   const [out] = await pool(ctx, [
     () =>
       ai(
         ctx,
         "revisor-geral",
-        `CRUZAMENTO DE CITAÇÕES (automático):\n${cit}\n\n${fileBlock("estrutura.md", estrutura)}\n\nTEXTO DO ARTIGO (sem a lista de referências):\n\n${body}`,
+        `CRUZAMENTO DE CITAÇÕES (automático):\n${cit}\n\nANÁLISE DE ESTRUTURA:\n${estrutura.trim()}\n\nSÍNTESE POR SEÇÃO:\n${digest || "(indisponível)"}\n\nSINAIS DE IA COLHIDOS NA LEITURA:\n${sinais || "(nenhum)"}\n\nCORREÇÕES POR SEÇÃO (contagem):\n${counts || "(indisponível)"}`,
       ),
   ]);
   const cut = out.search(/^#{1,3}\s*Ind[ií]cios de IA/im);
@@ -371,24 +482,96 @@ async function stepGeral(ctx: Ctx) {
   await put(ctx, "ia.md", `# Indícios de IA\n\n${ia}\n`);
 }
 
-/** O relatório consolida SÓ as análises já feitas (elas trazem seção, ¶ e trecho): o artigo não é reenviado. */
-async function stepRelatorio(ctx: Ctx) {
-  const names = ["resumos.md", "portugues.md", "estrutura.md", "secoes.md", "plagio.md", "geral.md", "ia.md"];
-  const blocks: string[] = [fileBlock("citacoes (resumo automático)", await citationSummary(ctx.id))];
-  const missing: string[] = [];
-  for (const n of names) {
-    const t = await readOptional(ctx.id, n);
-    if (t) blocks.push(fileBlock(n, t));
-    else missing.push(n);
+async function citationSection(id: string): Promise<string> {
+  try {
+    const r: CitationReport = JSON.parse(await fs.readFile(jobFile(id, "citacoes.json"), "utf8"));
+    const L = [
+      `- Estilo detectado: **${r.style}** · citações no texto: **${r.citations.length}** · referências na lista: **${r.references.length}**`,
+      `- Citadas no texto e **ausentes da lista**: **${r.citedButMissing.length}**${r.citedButMissing.length ? " — " + r.citedButMissing.map((c) => cell(c.raw)).join("; ") : ""}`,
+      `- Na lista e **nunca citadas**: **${r.listedButUncited.length}**${r.listedButUncited.length ? " — " + r.listedButUncited.map((x) => `[${x.id}] ${cell(x.raw.slice(0, 80))}`).join("; ") : ""}`,
+      "",
+      "> A **existência** de cada obra deve ser conferida manualmente (aba *Citações e referências*, com links de DOI, Scholar e Crossref).",
+    ];
+    return L.join("\n");
+  } catch {
+    return "_Cruzamento de citações indisponível._";
   }
-  if (ctx.dry) ctx.est.tokens += missing.length * 1500; // etapas ainda não feitas: tamanho típico
-  const note = missing.length ? `\n\nArquivos NÃO disponíveis (etapas não executadas): ${missing.join(", ")}.` : "";
-  const [report] = await pool(ctx, [
-    () => ai(ctx, "redator-relatorio", `Escreva o relatório final com base nos arquivos abaixo.${note}\n\n${blocks.filter(Boolean).join("\n\n")}`, { timeoutMs: 15 * 60 * 1000 }),
-  ]);
-  // Remove qualquer frase solta do agente antes do título do relatório.
-  const start = report.search(/^# /m);
-  await put(ctx, "relatorio.md", (start > 0 ? report.slice(start) : report) + "\n");
+}
+
+/**
+ * Relatório final: o agente escreve só a parte narrativa (visão geral, pontos fortes, problemas gerais, IA, plano);
+ * as tabelas por seção/¶, os resumos, as citações e a lista de plágio são inseridos PELO CÓDIGO a partir dos
+ * dados já calculados (sem tokens e sem risco de endereços inventados).
+ */
+async function stepRelatorio(ctx: Ctx) {
+  const saved = await loadLeitura(ctx.id);
+  const { rows, verdict } = saved ? rowsOf(saved.data, saved.order) : { rows: [] as Row[], verdict: new Map<string, string>() };
+  const groups = saved ? bySection(saved.order, rows) : [];
+  const counts = groups.map((g) => `- ${g.sec}: ${countLine(g.rows)}`).join("\n");
+  const top = rows
+    .filter((r) => r.sev !== "C")
+    .sort((a, b) => a.sev.localeCompare(b.sev))
+    .slice(0, 25)
+    .map((r) => `- ${SEV[r.sev]} ${r.sec} ¶${r.par || "geral"} (${r.tipo}): ${cell(r.txt).slice(0, 140)}`)
+    .join("\n");
+  const resumos = (await readOptional(ctx.id, "resumos.md")) ?? "";
+  const resumoVeredito = resumos.split("\n").filter((l) => /^## |Veredito/.test(l)).join("\n");
+  const estrutura = ((await readOptional(ctx.id, "estrutura.md")) ?? "").split("\n---\n").pop() ?? "";
+  const geral = (await readOptional(ctx.id, "geral.md")) ?? "";
+  const ia = (await readOptional(ctx.id, "ia.md")) ?? "";
+  const pl = saved ? plagioItems(saved) : [];
+  const plTop = pl.slice(0, 3).map((p) => `- [${RISK[p.risk] ?? p.risk}] ${p.sec} ¶${p.par}`).join("\n");
+  const missing = [!saved && "leitura do texto (Português/Seções/Plágio)", !resumos && "resumos", !geral && "geral/IA", !estrutura && "estrutura"].filter(Boolean);
+  const note = missing.length ? `\nETAPAS NÃO EXECUTADAS: ${missing.join(", ")}.` : "";
+  const prompt = [
+    `CORREÇÕES POR SEÇÃO (contagem):\n${counts || "(indisponível)"}`,
+    `ACHADOS MAIS GRAVES (🔴/🟠):\n${top || "(nenhum)"}`,
+    `RESUMOS (vereditos):\n${resumoVeredito || "(não executado)"}`,
+    `ESTRUTURA:\n${estrutura.trim() || "(não executada)"}`,
+    geral && fileBlock("geral.md", geral),
+    ia && fileBlock("ia.md", ia),
+    `PLÁGIO: ${pl.length} trecho(s) sinalizado(s) para pesquisa.\n${plTop}`,
+    `CITAÇÕES:\n${await citationSummary(ctx.id)}${note}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  // Estimativa: etapas ainda não feitas entram com o tamanho típico do que enviariam ao relatório.
+  if (ctx.dry) ctx.est.tokens += (saved ? 0 : 1200) + (geral ? 0 : 1500) + (ia ? 0 : 600) + (estrutura ? 0 : 800) + (resumos ? 0 : 300);
+  const [narrative] = await pool(ctx, [() => ai(ctx, "redator-relatorio", prompt, { timeoutMs: 15 * 60 * 1000 })]);
+
+  if (ctx.dry) return;
+  const md = await fs.readFile(jobFile(ctx.id, "article.md"), "utf8");
+  const title = /^#\s+(.+)$/m.exec(md)?.[1]?.replace(/[*_]/g, "").trim() ?? "artigo";
+
+  // Seções geradas pelo código
+  const sec4 = saved
+    ? groups
+        .map((g) => `### ${g.sec} — ${VERDICT[verdict.get(g.sec) ?? ""] ?? "—"}\n\n${g.rows.length ? table(g.rows, true) : "Sem correções nesta seção."}`)
+        .join("\n\n")
+    : "_A leitura do texto (etapas Português, Seções e Plágio) não foi executada._";
+  const sec4Final = rows.length || !saved ? sec4 : "Nenhuma correção necessária.\n\n" + sec4;
+  const sec5 = resumos ? resumos.replace(/^# .*\n+/, "").trim() : "_Etapa de resumos não executada._";
+  const sec7extra = pl.length
+    ? "\n\n**Trechos a pesquisar (plágio)** — detalhes e links na etapa *Trechos suspeitos*:\n" +
+      pl.slice(0, 5).map((p) => `- [${RISK[p.risk] ?? p.risk}] ${p.sec}${p.par ? `, ¶${p.par}` : ""}: “${cell(p.trecho)}”`).join("\n")
+    : "";
+
+  // Monta na ordem 1..9
+  const start = narrative.search(/^## \d\./m);
+  const parts = new Map<number, string>();
+  for (const chunk of (start >= 0 ? narrative.slice(start) : narrative).split(/^(?=## \d\.)/m)) {
+    const n = /^## (\d)\./.exec(chunk)?.[1];
+    if (n) parts.set(Number(n), chunk.trim());
+  }
+  const out: string[] = [`# Relatório de correções — ${title}`];
+  for (let n = 1; n <= 9; n++) {
+    if (n === 4) out.push(`## 4. Correções por seção e parágrafo\n\n${sec4Final}`);
+    else if (n === 5) out.push(`## 5. Resumos (PT · EN · ES)\n\n${sec5}`);
+    else if (n === 6) out.push(`## 6. Citações e referências\n\n${await citationSection(ctx.id)}`);
+    else if (n === 7) out.push((parts.get(7) ?? "## 7. Indícios de IA e plágio") + sec7extra);
+    else if (parts.has(n)) out.push(parts.get(n)!);
+  }
+  await put(ctx, "relatorio.md", out.join("\n\n") + "\n");
 }
 
 const RUNNERS: Partial<Record<StepId, (ctx: Ctx) => Promise<void>>> = {
@@ -416,12 +599,10 @@ const OUTPUTS: Partial<Record<StepId, string[]>> = {
 const TIMINGS = path.join(ROOT, "data", "timings.json");
 const DEFAULT_CHARS: Partial<Record<StepId, number>> = {
   resumos: 2800,
-  portugues: 2200,
+  portugues: 7500, // chamada da leitura integrada (português + seção + plágio + síntese + IA)
   estrutura: 3000,
-  secoes: 2600,
-  plagio: 1000,
   geral: 5500,
-  relatorio: 11000,
+  relatorio: 5000,
 };
 async function expectedChars(step: StepId) {
   try {
@@ -472,7 +653,14 @@ export async function runStep(id: string, step: StepId, opts: { force?: boolean 
   };
   const started = Date.now();
   try {
-    if (opts.force) await fs.rm(ctx.cacheDir, { recursive: true, force: true });
+    if (opts.force) {
+      await fs.rm(ctx.cacheDir, { recursive: true, force: true });
+      if (step === "portugues" || step === "secoes" || step === "plagio") {
+        // a leitura é compartilhada pelas três etapas: refazer do zero descarta a leitura guardada
+        await fs.rm(jobFile(id, "cache/leitura"), { recursive: true, force: true });
+        await fs.rm(jobFile(id, "leitura.json"), { force: true });
+      }
+    }
     for (const f of OUTPUTS[step] ?? []) await fs.rm(jobFile(id, f), { force: true });
     await updateStep(id, step, {
       status: "running",

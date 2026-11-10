@@ -28,13 +28,13 @@ Você envia o arquivo, avança **uma etapa por vez** e, no fim, recebe um relat�
 |---|-------|----------|-----------|
 | — | Conversão para Markdown | Código (**sem IA**): pandoc, pdftotext, LibreOffice | Extrai o texto, promove títulos em negrito a títulos, numera os parágrafos (¶) por seção. |
 | 1 | Citações e referências | Código (**sem IA**) — `lib/citations.ts` | Lista citações e referências, cruza texto × lista (autor-data e numérico; ABNT, APA, Vancouver), aponta *ausentes* e *nunca citadas* e gera links (DOI, Scholar, Crossref, OpenAlex) para a **checagem manual**. |
-| 2 | Resumos (PT · EN · ES) | Agente `revisor-resumos` (1 chamada curta) | Corrige o Resumo, o Abstract e o Resumen no idioma de cada um, avalia a estrutura do resumo, as palavras-chave e a consistência entre as três versões. |
-| 3 | Português | Agente `revisor-portugues` | Ortografia, gramática, concordância, regência, pontuação, clareza e registro acadêmico, com seção + ¶ e sugestão. |
-| 4 | Estrutura | Agente `analista-estrutura` | Avalia a divisão em seções (ausentes, ordem, proporção, títulos, hierarquia) e sugere reorganização. |
-| 5 | Seção a seção | Agente `analista-secao` | Analisa cada seção: função, lógica, afirmações sem suporte, método, coerência com o objetivo. |
-| 6 | Trechos suspeitos | Agente `cacador-plagio` + links por código | Marca trechos com sinais de cópia/paráfrase para **você pesquisar**, com frase de busca e links (Google, Scholar, Livros). |
-| 7 | Geral e indícios de IA | Agente `revisor-geral` (uma única leitura do artigo) | Avalia o artigo inteiro (contribuição, cadeia objetivo→conclusão, rigor) e procura indícios de texto gerado por IA, com evidências, contra-evidências e ressalvas. |
-| 8 | Relatório final | Agente `redator-relatorio` | Consolida tudo: veredito (*Aprovado — sem correções* / *ajustes menores* / *correções necessárias* / *reescrita*) e correções por seção e parágrafo. |
+| 2 | Resumos (PT · EN · ES) | Agente `revisor-resumos` | Corrige o Resumo, o Abstract e o Resumen no idioma de cada um, avalia a estrutura, as palavras-chave e a consistência entre as três versões. |
+| 3 | Português | Agente `revisor-texto` (**leitura integrada**) | Lê cada trecho **uma única vez** e devolve, de uma vez: erros de português, análise por seção, suspeitas de plágio, síntese e sinais de IA. Esta etapa mostra os achados de português. |
+| 4 | Estrutura | Agente `analista-estrutura` | Avalia a divisão em seções (ausentes, ordem, proporção, títulos) só pelo esqueleto e pelo início de cada seção. |
+| 5 | Seção a seção | Resultado da leitura integrada (**custo extra zero**) | Mostra a análise de cada seção: função, lógica, afirmações sem suporte, método, coerência. |
+| 6 | Trechos suspeitos | Resultado da leitura integrada (**custo extra zero**) + links por código | Lista trechos com sinais de cópia/paráfrase para **você pesquisar**, com frase de busca e links (Google, Scholar, Livros). |
+| 7 | Geral e indícios de IA | Agente `revisor-geral` | Avalia o artigo (contribuição, cadeia objetivo→conclusão, rigor) e os indícios de IA a partir das **sínteses e sinais já colhidos** — não relê o texto. |
+| 8 | Relatório final | Agente `redator-relatorio` + **código** | O agente escreve a parte narrativa (veredito, pontos fortes, problemas gerais, plano). As **tabelas de correções por seção e parágrafo** vêm direto dos dados guardados, montadas pelo código (sem custo e sem endereços inventados). |
 
 Os agentes ficam em [`.claude/agents/`](.claude/agents) e rodam pelo **Claude Code** instalado na sua máquina.
 
@@ -82,7 +82,7 @@ Abra <http://localhost:3000>. Nenhuma chave de API é guardada no projeto: o ace
 O custo é **mostrado antes de rodar**: cada botão de iniciar traz a estimativa (`≈ N mil tokens`), já descontando o que está guardado, e durante a etapa aparece o uso real (sem leituras de cache).
 
 - **Modo enxuto**: cada chamada de IA roda sem plugins, skills, servidores MCP nem ferramentas do seu Claude Code (~860 tokens de base, em vez de ~10 mil). Se não funcionar no seu ambiente, volta sozinho ao modo padrão (`CLAUDE_LEAN=0` força o padrão).
-- **O artigo é lido o mínimo possível**: Estrutura recebe só o esqueleto e o início de cada seção; Geral e Indícios de IA compartilham **uma** leitura; o Relatório consolida só as análises (não reenvia o artigo); a busca de plágio ignora Métodos/Resultados (dados do autor).
+- **Cada trecho do artigo é lido uma única vez** (leitura integrada, guardada em `leitura.json`): Português, Seções e Plágio saem da mesma chamada; Seções e Plágio custam zero. Estrutura recebe só esqueleto + início das seções; Geral trabalha sobre as sínteses; o Relatório monta as tabelas por código e o agente escreve só a narrativa.
 - **Rubricas compactas** (`knowledge/compact/`) embutidas na mensagem, e saídas dos agentes com limite de achados.
 - **Agrupamento**: seções pequenas viram uma só chamada (~14 mil caracteres).
 - **Cache por trecho**: retomar não paga de novo o que já foi analisado (invalidado se você editar um agente ou rubrica).

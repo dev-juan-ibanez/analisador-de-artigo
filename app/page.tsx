@@ -70,7 +70,7 @@ function verdictOf(md: string): { text: string; tone: string } | null {
 }
 
 const fmtTokens = (t?: number | null) =>
-  t == null ? "" : t < 1000 ? `≈ ${Math.max(100, Math.round(t / 100) * 100)} tokens` : `≈ ${Math.round(t / 1000)} mil tokens`;
+  t == null ? "" : t === 0 ? "sem custo extra: já lido junto" : t < 1000 ? `≈ ${Math.max(100, Math.round(t / 100) * 100)} tokens` : `≈ ${Math.round(t / 1000)} mil tokens`;
 
 function Bar({ pct, tone = "bg-accent" }: { pct: number; tone?: string }) {
   return (

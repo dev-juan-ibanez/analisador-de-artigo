@@ -48,18 +48,15 @@ function release() {
 }
 
 export type AgentName =
-  | "revisor-portugues"
-  | "analista-secao"
+  | "revisor-texto"
   | "analista-estrutura"
   | "revisor-resumos"
-  | "cacador-plagio"
   | "revisor-geral"
   | "redator-relatorio";
 
 /** Rubricas (knowledge/) embutidas na mensagem de cada agente: evita uma volta extra de leitura de arquivo. */
 const RUBRICS: Partial<Record<AgentName, string[]>> = {
-  "revisor-portugues": ["compact/portugues.md"],
-  "analista-secao": ["compact/estrutura.md"],
+  "revisor-texto": ["compact/portugues.md", "compact/estrutura.md", "compact/ia.md"],
   "analista-estrutura": ["compact/estrutura.md"],
   "revisor-resumos": ["compact/resumo.md"],
   "revisor-geral": ["compact/estrutura.md", "compact/ia.md", "compact/citacoes.md"],
@@ -81,6 +78,8 @@ async function withRubrics(agent: AgentName, prompt: string, override?: string[]
 export type RunOptions = {
   /** Rubricas (knowledge/) a embutir; padrão: as do agente. */
   rubrics?: string[];
+  /** Valida a resposta antes de guardá-la no cache (lance um erro para recusá-la). */
+  validate?: (out: string) => void;
   /** Caracteres de texto gerados até agora (andamento em tempo real). */
   onProgress?: (chars: number) => void;
   /** Tokens novos desta chamada (entrada + saída, sem leituras de cache). */
@@ -121,8 +120,8 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 
 async function mockAgent(agent: AgentName, opts: RunOptions): Promise<string> {
   const text =
-    agent === "cacador-plagio"
-      ? '{"passages":[],"style_notes":"(simulação)"}'
+    agent === "revisor-texto"
+      ? '{"pt":[["(simulação)",1,"B","exemplo","exemplo"]],"sc":[{"s":"(simulação)","v":"B","p":[[1,"C","exemplo","exemplo"]]}],"pl":[],"dg":[["(simulação)","síntese de exemplo"]],"ia":[]}'
       : agent === "redator-relatorio"
         ? "# Relatório de correções — (simulação)\n\n## 1. Visão geral do artigo\n**Veredito: Correções necessárias**\n\nTexto simulado."
         : `(simulação do agente ${agent})\n\n| ¶ | Sev. | Trecho | Problema | Sugestão |\n|---|---|---|---|---|\n| 1 | 🟡 | exemplo | exemplo | exemplo |`;
@@ -137,7 +136,7 @@ async function mockAgent(agent: AgentName, opts: RunOptions): Promise<string> {
 }
 
 /** Hash das definições (agente + rubricas): se você ajustar um agente, o cache antigo deixa de valer. */
-async function definitionHash(agent: AgentName): Promise<string> {
+export async function definitionHash(agent: AgentName): Promise<string> {
   const h = createHash("sha1");
   try {
     h.update(await fs.readFile(path.join(ROOT, ".claude", "agents", `${agent}.md`), "utf8"));
@@ -292,6 +291,7 @@ export async function runAgent(agent: AgentName, prompt: string, opts: RunOption
     release();
   }
 
+  opts.validate?.(out); // resposta inválida não vai para o cache (o "retomar" a refaz)
   if (cacheFile && opts.cacheDir) {
     await fs.mkdir(opts.cacheDir, { recursive: true });
     await fs.writeFile(cacheFile, out);
