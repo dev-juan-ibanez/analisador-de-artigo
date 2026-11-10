@@ -1,15 +1,18 @@
 /**
- * Vault do Obsidian por artigo (data/jobs/<id>/vault): mapa navegável dos dados já calculados.
+ * Cofre único do Obsidian (data/analisador-de-artigos/<artigo>/): mapa navegável dos dados já calculados.
  * Gerado só pelo código (nenhum token). Cada seção vira uma nota; cada parágrafo tem âncora (^p3),
- * então as correções linkam direto para o parágrafo: [[Seções/02 INTRODUÇÃO#^p3|¶3]].
+ * então as correções linkam direto para o parágrafo: [[${base}/Seções/02 INTRODUÇÃO#^p3|¶3]].
  */
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { jobDir, readOptional, getJob } from "./jobs";
+import { ROOT, readOptional, getJob, jobDir, type Job } from "./jobs";
 import { numberSections } from "./numbering";
 import { RISK, SEV, VERDICT, bySection, canon, cell, countLine, plagioItems, rowsOf, table, type Saved } from "./leitura";
 
-export const vaultDir = (id: string) => path.join(jobDir(id), "vault");
+/** Um único cofre do Obsidian para todos os artigos (registre-o uma vez): data/analisador-de-artigos/<artigo>/ */
+export const VAULT_NAME = "analisador-de-artigos";
+export const VAULT_ROOT = path.join(ROOT, "data", VAULT_NAME);
 
 const safe = (t: string) =>
   t
@@ -17,6 +20,10 @@ const safe = (t: string) =>
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 80) || "sem título";
+
+const folderOf = (job: Job) => `${safe(job.filename.replace(/\.[^.]+$/, ""))} · ${job.id.slice(0, 8)}`;
+export const articleDir = (job: Job) => path.join(VAULT_ROOT, folderOf(job));
+export const mapNote = (job: Job) => `${folderOf(job)}/00 Mapa do artigo`;
 
 const yaml = (o: Record<string, string | number | string[]>) =>
   "---\n" +
@@ -29,16 +36,18 @@ export async function syncVault(id: string): Promise<void> {
   const job = await getJob(id);
   const md = await readOptional(id, "article.md");
   if (!job || !md) return;
-  const dir = vaultDir(id);
+  const dir = articleDir(job);
+  const base = folderOf(job);
+  await fs.rm(path.join(jobDir(id), "vault"), { recursive: true, force: true }); // formato antigo (um cofre por artigo)
+  await fs.mkdir(path.join(VAULT_ROOT, ".obsidian"), { recursive: true });
+  await fs.writeFile(path.join(VAULT_ROOT, ".obsidian", "app.json"), "{}");
   await fs.rm(path.join(dir, "Seções"), { recursive: true, force: true });
   await fs.mkdir(path.join(dir, "Seções"), { recursive: true });
-  await fs.mkdir(path.join(dir, ".obsidian"), { recursive: true });
-  await fs.writeFile(path.join(dir, ".obsidian", "app.json"), "{}");
 
   const sections = numberSections(md).filter((s) => s.paras.length);
   const names = new Map(sections.map((s, i) => [s.title, `${String(i + 1).padStart(2, "0")} ${safe(s.title)}`]));
   const noteOf = (title: string) => names.get(title) ?? safe(title);
-  const link = (sec: string, par: number) => `[[Seções/${noteOf(sec)}#^p${par}\\|¶${par}]]`;
+  const link = (sec: string, par: number) => `[[${base}/Seções/${noteOf(sec)}#^p${par}\\|¶${par}]]`;
 
   const leitura = await readOptional(id, "leitura.json");
   const saved: Saved | null = leitura ? JSON.parse(leitura) : null;
@@ -53,8 +62,8 @@ export async function syncVault(id: string): Promise<void> {
     const g = groups.find((x) => x.sec === s.title);
     const rs = g?.rows ?? [];
     const v = VERDICT[verdict.get(s.title) ?? ""] ?? "não analisada";
-    const prev = sections[i - 1] && `[[Seções/${noteOf(sections[i - 1].title)}|← anterior]]`;
-    const next = sections[i + 1] && `[[Seções/${noteOf(sections[i + 1].title)}|próxima →]]`;
+    const prev = sections[i - 1] && `[[${base}/Seções/${noteOf(sections[i - 1].title)}|← anterior]]`;
+    const next = sections[i + 1] && `[[${base}/Seções/${noteOf(sections[i + 1].title)}|próxima →]]`;
     const ia = (saved?.data.ia ?? []).filter((r) => canon(order, r[0]) === s.title);
     const pls = pl.filter((p) => p.sec === s.title);
     const L = [
@@ -69,7 +78,7 @@ export async function syncVault(id: string): Promise<void> {
         tags: ["seção", v === "não analisada" ? "sem-análise" : "analisada"],
       }),
       `# ${s.title}`,
-      `[[00 Mapa do artigo|↑ mapa]] · ${[prev, next].filter(Boolean).join(" · ")}`,
+      `[[${base}/00 Mapa do artigo|↑ mapa]] · ${[prev, next].filter(Boolean).join(" · ")}`,
       "",
       `## Síntese`,
       digest.get(s.title) ?? "_(sem síntese)_",
@@ -101,17 +110,17 @@ export async function syncVault(id: string): Promise<void> {
     const t = await readOptional(id, file);
     if (!t) continue;
     present.push(note.replace(/\.md$/, ""));
-    await fs.writeFile(path.join(dir, note), `${yaml({ tipo: tag, artigo: job.filename, tags: [tag] })}[[00 Mapa do artigo|↑ mapa]]\n\n${t}`);
+    await fs.writeFile(path.join(dir, note), `${yaml({ tipo: tag, artigo: job.filename, tags: [tag] })}[[${base}/00 Mapa do artigo|↑ mapa]]\n\n${t}`);
   }
   if (rows.length) {
     present.push("Correções");
     const body = groups
       .filter((g) => g.rows.length)
-      .map((g) => `### [[Seções/${noteOf(g.sec)}|${g.sec}]] — ${VERDICT[verdict.get(g.sec) ?? ""] ?? "—"}\n\n${table(g.rows, true, link)}`)
+      .map((g) => `### [[${base}/Seções/${noteOf(g.sec)}|${g.sec}]] — ${VERDICT[verdict.get(g.sec) ?? ""] ?? "—"}\n\n${table(g.rows, true, link)}`)
       .join("\n\n");
     await fs.writeFile(
       path.join(dir, "Correções.md"),
-      `${yaml({ tipo: "correções", artigo: job.filename, tags: ["correções"] })}[[00 Mapa do artigo|↑ mapa]]\n\n# Correções por seção e parágrafo\n\n${body}\n`,
+      `${yaml({ tipo: "correções", artigo: job.filename, tags: ["correções"] })}[[${base}/00 Mapa do artigo|↑ mapa]]\n\n# Correções por seção e parágrafo\n\n${body}\n`,
     );
   }
 
@@ -127,14 +136,38 @@ export async function syncVault(id: string): Promise<void> {
     ...sections.map((s, i) => {
       const rs = groups.find((x) => x.sec === s.title)?.rows ?? [];
       const n = (k: "A" | "B" | "C") => rs.filter((r) => r.sev === k).length;
-      return `| ${i + 1} | [[Seções/${noteOf(s.title)}\\|${cell(s.title)}]] | ${VERDICT[verdict.get(s.title) ?? ""] ?? "—"} | ${n("A")} | ${n("B")} | ${n("C")} | ${s.paras.length} |`;
+      return `| ${i + 1} | [[${base}/Seções/${noteOf(s.title)}\\|${cell(s.title)}]] | ${VERDICT[verdict.get(s.title) ?? ""] ?? "—"} | ${n("A")} | ${n("B")} | ${n("C")} | ${s.paras.length} |`;
     }),
     "",
     `**Legenda:** ${SEV.A} crítico · ${SEV.B} importante · ${SEV.C} menor`,
     "",
     "## Outras notas",
-    present.length ? present.map((n) => `- [[${n}]]`).join("\n") : "_(as notas das etapas aparecem conforme você avança)_",
+    present.length ? present.map((n) => `- [[${base}/${n}|${n}]]`).join("\n") : "_(as notas das etapas aparecem conforme você avança)_",
     "",
   ];
   await fs.writeFile(path.join(dir, "00 Mapa do artigo.md"), L.join("\n"));
+}
+
+/** Remove do cofre a pasta do artigo (usado ao excluir a análise). */
+export async function removeVault(id: string): Promise<void> {
+  const job = await getJob(id);
+  if (job) await fs.rm(articleDir(job), { recursive: true, force: true });
+}
+
+/** O cofre já está registrado no Obsidian? (leitura da configuração do próprio Obsidian; só consulta) */
+export async function obsidianRegistered(): Promise<boolean> {
+  const home = os.homedir();
+  const cfg =
+    process.platform === "darwin"
+      ? path.join(home, "Library", "Application Support", "obsidian", "obsidian.json")
+      : process.platform === "win32"
+        ? path.join(process.env.APPDATA ?? path.join(home, "AppData", "Roaming"), "obsidian", "obsidian.json")
+        : path.join(process.env.XDG_CONFIG_HOME ?? path.join(home, ".config"), "obsidian", "obsidian.json");
+  try {
+    const j = JSON.parse(await fs.readFile(cfg, "utf8")) as { vaults?: Record<string, { path?: string }> };
+    const want = path.resolve(VAULT_ROOT);
+    return Object.values(j.vaults ?? {}).some((v) => v.path && path.resolve(v.path) === want);
+  } catch {
+    return false;
+  }
 }

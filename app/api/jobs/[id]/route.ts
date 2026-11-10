@@ -1,4 +1,5 @@
 import { deleteJob, getJob, hasActiveRun, isValidId } from "@/lib/jobs";
+import { removeVault } from "@/lib/vault";
 
 export async function GET(_req: Request, ctx: RouteContext<"/api/jobs/[id]">) {
   const { id } = await ctx.params;
@@ -14,6 +15,7 @@ export async function DELETE(_req: Request, ctx: RouteContext<"/api/jobs/[id]">)
   if (hasActiveRun(id)) {
     return Response.json({ error: "Há uma análise em andamento. Cancele antes de excluir." }, { status: 409 });
   }
+  await removeVault(id).catch(() => {});
   await deleteJob(id);
   return Response.json({ deleted: id });
 }

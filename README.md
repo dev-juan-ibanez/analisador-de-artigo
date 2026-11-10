@@ -79,11 +79,13 @@ Abra <http://localhost:3000>. Nenhuma chave de API é guardada no projeto: o ace
 
 ## Mapa do artigo no Obsidian
 
-Cada artigo ganha um **vault do Obsidian** (`data/jobs/<id>/vault/`), gerado pelo código (sem tokens) a cada etapa concluída:
-um **Mapa** com as seções e os totais de correções, **uma nota por seção** (síntese, correções, sinais de IA, suspeitas de plágio e o texto com âncoras `^p3`),
-e as notas das demais etapas. Em cada correção, o **¶ é um link** que leva direto ao parágrafo; a visão de grafo mostra como tudo se liga.
-Na tela do artigo, o botão **Obsidian** gera o mapa, copia o caminho e tenta abri-lo (se o Obsidian pedir, use *Abrir pasta como cofre* e cole o caminho).
-O Obsidian é opcional: o app funciona sem ele.
+Todos os artigos ficam em **um único cofre do Obsidian**: `data/analisador-de-artigos/` (uma subpasta por artigo), gerado pelo código (sem tokens) a cada etapa concluída.
+Cada artigo tem um **Mapa** com as seções e os totais de correções, **uma nota por seção** (síntese, correções, sinais de IA, suspeitas de plágio e o texto com âncoras `^p3`) e as notas das demais etapas.
+Em cada correção, o **¶ é um link** que leva direto ao parágrafo; a visão de grafo mostra como tudo se liga.
+
+**Configuração única:** no Obsidian, *Abrir pasta como cofre* → selecione `data/analisador-de-artigos/` (o botão **Obsidian** da tela copia o caminho). Depois disso, o botão abre direto o mapa de qualquer artigo.
+(O Obsidian só abre por link cofres já registrados; por isso o sistema confere isso antes e mostra a instrução se ainda não estiver.)
+Edições nas notas geradas **não voltam** para o sistema e são sobrescritas; suas próprias notas, em outros arquivos, são preservadas. O Obsidian é opcional.
 
 > O que economiza tokens não é o Obsidian em si, e sim os dados serem **endereçáveis e guardados por conteúdo**: nada é relido nem recalculado.
 

@@ -1,11 +1,18 @@
 import { getJob, isValidId } from "@/lib/jobs";
-import { syncVault, vaultDir } from "@/lib/vault";
+import { VAULT_NAME, VAULT_ROOT, articleDir, mapNote, obsidianRegistered, syncVault } from "@/lib/vault";
 
-/** Garante o vault do Obsidian do artigo e devolve o caminho e o link para abri-lo. */
+/**
+ * Garante o mapa do artigo no cofre do Obsidian. O Obsidian só abre por URL cofres já registrados;
+ * por isso só devolvemos a URL quando o cofre estiver registrado (senão, a instrução de registro).
+ */
 export async function GET(_req: Request, ctx: RouteContext<"/api/jobs/[id]/vault">) {
   const { id } = await ctx.params;
-  if (!isValidId(id) || !(await getJob(id))) return Response.json({ error: "não encontrado" }, { status: 404 });
+  const job = isValidId(id) ? await getJob(id) : null;
+  if (!job) return Response.json({ error: "não encontrado" }, { status: 404 });
   await syncVault(id);
-  const path = vaultDir(id);
-  return Response.json({ path, uri: `obsidian://open?path=${encodeURIComponent(path)}` });
+  const registered = await obsidianRegistered();
+  const uri = registered
+    ? `obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}&file=${encodeURIComponent(mapNote(job))}`
+    : null;
+  return Response.json({ root: VAULT_ROOT, path: articleDir(job), registered, uri });
 }

@@ -241,17 +241,23 @@ export default function Home() {
     if (j.ok) apply(await j.json());
   }
 
-  /** Abre o mapa do artigo (vault do Obsidian) e copia o caminho, para o caso de o Obsidian pedir a pasta. */
+  /** Abre o mapa do artigo no Obsidian. O cofre precisa ser registrado uma única vez. */
   async function openObsidian() {
     if (!job) return;
     const r = await fetch(`/api/jobs/${job.id}/vault`).catch(() => null);
     if (!r?.ok) return setError("Não consegui preparar o mapa do Obsidian.");
-    const d: { path: string; uri: string } = await r.json();
+    const d: { root: string; path: string; registered: boolean; uri: string | null } = await r.json();
+    if (d.registered && d.uri) {
+      setInfo(null);
+      window.location.href = d.uri;
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(d.path);
+      await navigator.clipboard.writeText(d.root);
     } catch {}
-    setInfo(`Mapa gerado em: ${d.path} (caminho copiado). Se o Obsidian não abrir sozinho: “Abrir pasta como cofre” e cole o caminho.`);
-    window.location.href = d.uri;
+    setInfo(
+      `Primeira vez: no Obsidian, escolha “Abrir pasta como cofre” e selecione esta pasta (o caminho já foi copiado): ${d.root} — depois disso, o botão Obsidian abre direto o mapa de qualquer artigo.`,
+    );
   }
 
   async function cancel() {
@@ -396,7 +402,7 @@ export default function Home() {
               </button>
               <button
                 onClick={openObsidian}
-                title="Abre o mapa deste artigo no Obsidian: uma nota por seção, com link para cada parágrafo"
+                title="Abre o mapa deste artigo no Obsidian (cofre único; na primeira vez você precisa abrir a pasta como cofre)"
                 className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1 text-sm hover:border-accent hover:text-accent"
               >
                 <Icon name="sparkle" /> Obsidian
